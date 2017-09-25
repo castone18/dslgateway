@@ -20,13 +20,13 @@
 // | dslgateway.c
 // |
 // |    This file implements a dsl gateway that splits outgoing IP traffic between
-// | two DSL lines. This program us used in rural settings where DSL speeds are low.
+// | two DSL lines. This program is used in rural settings where DSL speeds are low.
 // | It allows two DSL lines of differing speeds to be bonded into a single internet
-// | connection, potentially doubling the user's internet bandwith. The normal
-// | scenario is that this program is run on an internet gateway computer in the
-// | home and it connects to a VPS running the same program. In this code,
+// | connection, providing the sum of the two lines internet bandwidth minus a small
+// | overhead. The normal scenario is that this program is run on an internet gateway
+// | computer in the home and it connects to a VPS running the same program. In this code,
 // | the copy on the home gateway is called the client, and the copy on the VPS
-// | is called the server.
+// | is called the server. 
 // |
 // | This program has a few features that make it better suited than the standard
 // | ethernet bonding driver in the Linux kernel. Those features are:
@@ -51,9 +51,9 @@
 // |        over the other line. Then when Netflix traffic ends, both lines are
 // |        used again.
 // |     4. This program does not encapsulate tcp packets inside other tcp packets.
-// |        The overhead of this program is only 5 bytes per packet with IPv4, compared
+// |        The overhead of this program is only 6 bytes per packet with IPv4, compared
 // |        to 40 bytes when tcp is encapsulated in tcp. Due to the size of the
-// |        IPv6 address, the overhead for IPv6 is 17 bytes, but that is still much
+// |        IPv6 address, the overhead for IPv6 is 18 bytes, but that is still much
 // |        lower than 60 bytes for tcp encapsulated in tcp with IPv6.
 // |
 // +----------------------------------------------------------------------------
@@ -80,6 +80,7 @@
 #include <time.h>
 #include <linux/if_tun.h>
 #include <linux/sockios.h>
+#include <linux/limits.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -94,31 +95,32 @@
 #include <netinet/if_ether.h>
 #include <netinet/ip6.h>
 #include <ifaddrs.h>
+#include <libconfig.h>
 
 #include "circular_buffer.h"
 #include "log.h"
 #include "comms.h"
 #include "util.h"
 
-#define CLIENT 			0
-#define SERVER 			1
-#define PORTSTR                 "1010"
-#define DEFAULT_NUM_MBUFS       12288
-#define RXPRIO                  50
-#define TXPRIO                  60
-#define HOME_TO_VPS_PRIO        40
-#define HOME_FROM_VPS_PRIO      40
-#define VPS_PKT_MANGLER_PRIO    40
-#define IFRATIO_CHANGE_PRIO     20
-#define INGRESS_IF              2
-#define EGRESS_IF               0
-#define REORDER_BUF_SZ          8
-#define ONE_MS                  1000000
+#define CLIENT                              0
+#define SERVER                              1
+#define DEFAULT_NUM_MBUFS                   12288
+#define RXPRIO                              50
+#define TXPRIO                              60
+#define HOME_TO_VPS_PRIO                    40
+#define HOME_FROM_VPS_PRIO                  40
+#define VPS_PKT_MANGLER_PRIO                40
+#define IFRATIO_CHANGE_PRIO                 20
+#define INGRESS_IF                          2
+#define EGRESS_IF                           0
+#define REORDER_BUF_SZ                      8
+#define ONE_MS                              1000000
 #define REORDER_BUF_TIMEOUT                 200*ONE_MS
 #define SLOW_CNT_MAX                        5
 #define HOME_TO_VPS_PKT_MANGLER_THREADNO    6
 #define HOME_FROM_VPS_PKT_MANGLER_THREADNO  7
 #define VPS_PKT_MANGLER_THREADNO            2
+#define DEFAULT_CONFIG_FILE_NAME            "/etc/dslgateway.cfg"
 
 struct tcp_mbuf_s {
     struct ether_header eth_hdr;
@@ -165,15 +167,24 @@ struct comms_thread_parms_s {
     pthread_t   thread_id;
 };
 
+struct if_config_s {
+    int                 if_rx_fd;
+    int                 if_tx_fd;
+    char                if_name[IFNAMSIZ];
+    char                if_brname[IFNAMSIZ];
+    struct if_queue_s   if_rxq;
+    struct if_queue_s   if_txq;
+    uint8_t             if_ratio;
+#ifdef IPV6
+    struct sockaddr_in6 if_ipaddr;
+#else
+    struct sockaddr_in  if_ipaddr;
+#endif
+};
+
 static char                 *progname;
-static int                  if_fd[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-static char                 if_prefix[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES][IFNAMSIZ+1];
-static char                 if_name[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES][IFNAMSIZ+1];
-static char                 if_brname[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES][IFNAMSIZ+1];
-static struct if_queue_s    if_rxq[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-static struct if_queue_s    if_txq[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-static unsigned int         if_ratio[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-static unsigned int         egresscnt, ingresscnt;
+static struct if_config_s   if_config[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
+static unsigned int         egresscnt=0, ingresscnt=0;
 static bool                 is_daemon=false;
 static mempool              mPool;
 static bool                 wipebufs=false;
@@ -181,7 +192,7 @@ static uint8_t              pkt_seq_no=0;
 static int                  cliserv=-1;
 static int                  comms_peer_fd;
 static struct statistics_s  if_stats;
-static unsigned int         cc_port=PORT;
+static unsigned int         cc_port=PORT, rmt_port=PORT;
 static struct thread_list_s dsl_threads[((NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES)*2)+2];
 static unsigned int         num_threads;
 static int                  thread_exit_rc;
@@ -191,13 +202,14 @@ static struct itimerspec    reorder_buf_intvl;
 static unsigned int         reorder_if_cnt[2] = {0, 0};
 #if defined(IPV6)
 static struct sockaddr_in6  peer_addr, client_addr[NUM_EGRESS_INTERFACES];
-static struct sockaddr_in6  if_ipaddr[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
 #else
 static struct sockaddr_in   peer_addr, client_addr[NUM_EGRESS_INTERFACES];
-static struct sockaddr_in   if_ipaddr[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
 #endif
 static bool                 peer_addr_valid=false;
 static bool                 debug=false;
+static char                 config_file_name[PATH_MAX];
+static unsigned int         n_mbufs=DEFAULT_NUM_MBUFS;
+static char                 *remote_name;
 
 
 
@@ -222,7 +234,7 @@ static int tuntap_init(char *ifname)
     int             fd, rc;
 
     if (ifname == NULL) return -1*EINVAL;
-    
+
     if (debug)
         log_msg(LOG_INFO, "%s-%d: Opening %s device.\n", __FUNCTION__, __LINE__, ifname);
 
@@ -257,8 +269,8 @@ static int tuntap_init(char *ifname)
 // +----------------------------------------------------------------------------
 static void exit_level1_cleanup(void)
 {
-    if (if_fd[INGRESS_IF] > 0)
-        tuntap_exit(if_name[INGRESS_IF], if_fd[INGRESS_IF]);
+    if (if_config[INGRESS_IF].if_rx_fd > 0)
+        tuntap_exit(if_config[INGRESS_IF].if_name, if_config[INGRESS_IF].if_rx_fd);
     log_msg(LOG_INFO, "%s daemon ends.\n", progname);
 }
 
@@ -294,8 +306,8 @@ static void reorder_buf_timer(union sigval arg)
         if (reorder_buf[i] != NULL) {
             tsdiff = subtract_ts(&ts, &reorder_buf[i]->rx_time);
             if (tsdiff.tv_sec || (tsdiff.tv_nsec > REORDER_BUF_TIMEOUT)) {
-                circular_buffer_push(if_txq[INGRESS_IF].if_pkts, reorder_buf[i]);
-                sem_post(&if_txq[INGRESS_IF].if_ready);
+                circular_buffer_push(if_config[INGRESS_IF].if_txq.if_pkts, reorder_buf[i]);
+                sem_post(&if_config[INGRESS_IF].if_txq.if_ready);
                 pkt_seq_no = reorder_buf[i]->seq_no + 1;
                 reorder_buf[i] = NULL;
             } else break;
@@ -343,26 +355,12 @@ static void disarm_reorder_buf_timer(void)
 static void usage(char *progname)
 {
   printf("Usage:\n");
-  printf("%s -e <prefix> -i <ifacename> [-p <port>] [-s|-c <serverIP>] [-n <#mbufs>] [-d] [-f]\n", progname);
-  printf("%s -h\n", progname);
-  printf("\n");
-  printf("-e <prefix>:      (mandatory) Prefix that is used to generate the two egress interface names.\n");
-  printf("                  Two egress interface names will be generated as <prefix>0 and <prefix>1.\n");
-  printf("                  These are tap interfaces, and they must exist and be bridged to a bridge\n");
-  printf("                  with name <prefix>br0 or <prefix>br1 respectively. On the vps gateway this is\n");
-  printf("                  the only name provided because on the vps gateway, all traffic comes and goes\n");
-  printf("                  through a single interface.\n");
-  printf("-i <prefix>:      (mandatory) Prefix for generation of ingress tap device name (<prefix>) and ingress\n");
-  printf("                  bridge name (<prefix>br). This option is only used in client mode (which runs on\n");
-  printf("                  the home gateway). The ethernet interface on the home gateway that is connected to\n");
-  printf("                  the home network must be bridged to this interface.\n");
-  printf("-p <port>:        (optional) Port to open on egress bridge for control channel communications between\n");
-  printf("                  client and server. If not provided, defaults to %d.\n", PORT);
-  printf("-s|-c <serverIP>: (mandatory) run in server mode (-s), or specify server address (-c <serverIP>).\n");
-  printf("-n <#mbufs>:      (optional) Number of mbufs to allocate.\n");
-  printf("-d:               outputs debug information while running.\n");
-  printf("-f:               stay in foreground instead of daemonizing.\n");
-  printf("-h:               prints this help text.\n");
+  printf("%s [-c <config filename>] [-d] [-f]\n", progname);
+  printf("%s -h\n\n", progname);
+  printf("-c <config filename>: full path to config file. Defaults to /etc/dslgateway.cfg.\n");
+  printf("-d:                   outputs debug information while running.\n");
+  printf("-f:                   stay in foreground instead of daemonizing.\n");
+  printf("-h:                   prints this help text.\n");
   exit(1);
 }
 
@@ -403,10 +401,10 @@ static void *rx_thread(void * arg)
         }
         mbufc = (unsigned char *) mbuf;
         // TODO: deal with partial packet receipt
-        while (((rxSz = read(if_fd[rxq->if_index], (void *) mbuf, sizeof(union mbuf_u))) < 0) && (errno == EINTR));
+        while (((rxSz = read(if_config[rxq->if_index].if_rx_fd, (void *) mbuf, sizeof(union mbuf_u))) < 0) && (errno == EINTR));
         if (rxSz < 0) {
-            log_msg(LOG_ERR, "%s-%d: Error reading packets from interface %s - %s",
-                    __FUNCTION__, __LINE__, if_name[rxq->if_index], strerror(errno));
+            log_msg(LOG_ERR, "%s-%d: Error reading raw packets from interface %s - %s",
+                    __FUNCTION__, __LINE__, if_config[rxq->if_index].if_name, strerror(errno));
             continue;
         }
         mbuf->if_index = rxq->if_index;
@@ -478,23 +476,23 @@ static void *tx_thread(void * arg)
 #else
     struct ip           *iphdr;
 #endif
-    
+
     while (txq->if_thread->keep_going) {
         while ((sem_wait(&txq->if_ready) == -1) && (errno == EINTR));
         if ((mbuf = (struct mbuf_s*) circular_buffer_pop(txq->if_pkts)) == NULL) continue;
         mbufc   = (unsigned char *) mbuf;
 #ifdef IPV6
-        iphdr   = (struct ip6_hdr *) (mbufc + sizeof(struct ether_header));
+        iphdr   = (struct ip6_hdr *) mbufc;
         // TODO: deal with partial packet send
-        while (((txSz = write(if_fd[txq->if_index], (const void *) mbuf, iphdr->ip6_plen+sizeof(struct ether_header)+sizeof(struct ip6_hdr))) == -1) && (errno==EINTR));
+        while (((txSz = write(if_config[txq->if_index].if_tx_fd, (const void *) mbuf, iphdr->ip6_plen+sizeof(struct ip6_hdr))) == -1) && (errno==EINTR));
 #else
-        iphdr   = (struct ip *) (mbufc + sizeof(struct ether_header));
+        iphdr   = (struct ip *) mbufc;
         // TODO: deal with partial packet send
-        while (((txSz = write(if_fd[txq->if_index], (const void *) mbuf, iphdr->ip_len+sizeof(struct ether_header))) == -1) && (errno==EINTR));
-#endif
+        while (((txSz = write(if_config[txq->if_index].if_tx_fd, (const void *) mbuf, iphdr->ip_len+sizeof(struct ip))) == -1) && (errno==EINTR));
+#endif        
         if (txSz == -1) {
-            log_msg(LOG_ERR, "%s-%d: Error writing ip packet on interface %s - %s.\n",
-                    __FUNCTION__, __LINE__, if_name[txq->if_index], strerror(errno));
+            log_msg(LOG_ERR, "%s-%d: Error sending ip packet on interface %s - %s.\n",
+                    __FUNCTION__, __LINE__, if_config[txq->if_index].if_name, strerror(errno));
         }
         mempool_free(mPool, mbuf, wipebufs);
         if_stats.if_tx_pkts[txq->if_index]++;
@@ -537,8 +535,8 @@ static void *home_to_vps_pkt_mangler_thread(void * arg)
 #endif
 
     while (dsl_threads[HOME_TO_VPS_PKT_MANGLER_THREADNO].keep_going) {
-        sem_wait(&if_rxq[INGRESS_IF].if_ready);
-        if ((mbuf = circular_buffer_pop(if_rxq[INGRESS_IF].if_pkts)) == NULL) continue;
+        sem_wait(&if_config[INGRESS_IF].if_rxq.if_ready);
+        if ((mbuf = circular_buffer_pop(if_config[INGRESS_IF].if_rxq.if_pkts)) == NULL) continue;
         mbufc                   = (unsigned char *) mbuf;
         // Save the destination address at the end of the packet. Also save the if_ratios
         // in one byte at the end of the packet. Increase packet length by the length
@@ -550,19 +548,20 @@ static void *home_to_vps_pkt_mangler_thread(void * arg)
         memcpy(sv_dest_addr, &iphdr->ip6_dst, sizeof(struct in6_addr));
         if_ratios               = (uint8_t *) (mbufc + sizeof(struct ether_header) + sizeof(struct ip6_hdr) + iphdr->ip6_plen + sizeof(struct in6_addr));
         memcpy(&iphdr->ip6_dst, &peer_addr.sin6_addr, sizeof(struct in6_addr));
-        iphdr->ip6_plen         = iphdr->ip6_plen + sizeof(struct in6_addr) + 1;
+        iphdr->ip6_plen         = iphdr->ip6_plen + sizeof(struct in6_addr) + 2;
 #else
         iphdr                   = (struct ip *) (mbufc + sizeof(struct ether_header));
         sv_dest_addr            = (struct in_addr *) (mbufc + sizeof(struct ether_header) + iphdr->ip_len);
         memcpy(sv_dest_addr, &iphdr->ip_dst, sizeof(struct in_addr));
         if_ratios               = (uint8_t *) (mbufc + sizeof(struct ether_header) + iphdr->ip_len + sizeof(struct in_addr));
         iphdr->ip_dst.s_addr    = peer_addr.sin_addr.s_addr;
-        iphdr->ip_len           = iphdr->ip_len + sizeof(struct in_addr) + 1;
+        iphdr->ip_len           = iphdr->ip_len + sizeof(struct in_addr) + 2;
         iphdr->ip_sum           = iphdr_checksum((unsigned short*)(mbufc + sizeof(struct ether_header)), (sizeof(struct iphdr)/2));
 #endif
-        *if_ratios              = ((if_ratio[0] & 0xF) << 4) | (if_ratio[1] & 0xF);
-        circular_buffer_push(if_txq[active_if].if_pkts, mbuf);
-        sem_post(&if_txq[active_if].if_ready);
+        if_ratios[0]            = if_config[0].if_ratio;
+        if_ratios[1]            = if_config[1].if_ratio;
+        circular_buffer_push(if_config[active_if].if_txq.if_pkts, mbuf);
+        sem_post(&if_config[active_if].if_txq.if_ready);
         active_if               = (active_if+1) % NUM_EGRESS_INTERFACES;
     }
 
@@ -579,8 +578,8 @@ static void drain_reorder_buf(bool *reorder_active)
     int     i=0, j;
 
     while ((reorder_buf[i] != NULL) && (i<REORDER_BUF_SZ)) {
-        circular_buffer_push(if_txq[INGRESS_IF].if_pkts, reorder_buf[i]);
-        sem_post(&if_txq[INGRESS_IF].if_ready);
+        circular_buffer_push(if_config[INGRESS_IF].if_txq.if_pkts, reorder_buf[i]);
+        sem_post(&if_config[INGRESS_IF].if_txq.if_ready);
         pkt_seq_no++;
         reorder_buf[i] = NULL;
         i++;
@@ -608,12 +607,12 @@ static void force_drain_reorder_buf(void)
 {
     int i;
 
-    if_ratio[0] = reorder_if_cnt[0];
-    if_ratio[1] = reorder_if_cnt[1];
+    if_config[0].if_ratio = reorder_if_cnt[0];
+    if_config[1].if_ratio = reorder_if_cnt[1];
     for (i=0; i<REORDER_BUF_SZ; i++) {
         if (reorder_buf[i] != NULL) {
-            circular_buffer_push(if_txq[INGRESS_IF].if_pkts, reorder_buf[i]);
-            sem_post(&if_txq[INGRESS_IF].if_ready);
+            circular_buffer_push(if_config[INGRESS_IF].if_txq.if_pkts, reorder_buf[i]);
+            sem_post(&if_config[INGRESS_IF].if_txq.if_ready);
             reorder_buf[i] = NULL;
         }
     }
@@ -642,8 +641,8 @@ static void *home_from_vps_pkt_mangler_thread(void * arg)
 
     for (i=0; i<REORDER_BUF_SZ; i++) reorder_buf[i] = NULL;
     while (dsl_threads[HOME_FROM_VPS_PKT_MANGLER_THREADNO].keep_going) {
-        sem_wait(&if_rxq[EGRESS_IF].if_ready);
-        if ((mbuf = circular_buffer_pop(if_rxq[EGRESS_IF].if_pkts)) == NULL) continue;
+        sem_wait(&if_config[EGRESS_IF].if_rxq.if_ready);
+        if ((mbuf = circular_buffer_pop(if_config[EGRESS_IF].if_rxq.if_pkts)) == NULL) continue;
         mbufc                   = (unsigned char *) mbuf;
 #ifdef IPV6
         iphdr                   = (struct ip6_hdr *) (mbufc + sizeof(struct ether_header));
@@ -691,8 +690,8 @@ static void *home_from_vps_pkt_mangler_thread(void * arg)
                 continue;
             }
         }
-        circular_buffer_push(if_txq[INGRESS_IF].if_pkts, mbuf);
-        sem_post(&if_txq[INGRESS_IF].if_ready);
+        circular_buffer_push(if_config[INGRESS_IF].if_txq.if_pkts, mbuf);
+        sem_post(&if_config[INGRESS_IF].if_txq.if_ready);
         pkt_seq_no++;
         // Send any additional packets that were accumulating in the reorder buffer
         if (reorder_active) drain_reorder_buf(&reorder_active);
@@ -723,8 +722,8 @@ static void *vps_pkt_mangler_thread(void * arg)
 
     active_if_cnt[0] = active_if_cnt[1] = 0;
     while (dsl_threads[VPS_PKT_MANGLER_THREADNO].keep_going) {
-        sem_wait(&if_rxq[EGRESS_IF].if_ready);
-        if ((mbuf = circular_buffer_pop(if_rxq[EGRESS_IF].if_pkts)) == NULL) continue;
+        sem_wait(&if_config[EGRESS_IF].if_rxq.if_ready);
+        if ((mbuf = circular_buffer_pop(if_config[EGRESS_IF].if_rxq.if_pkts)) == NULL) continue;
         mbufc                       = (unsigned char *) mbuf;
 #ifdef IPV6
         iphdr                   = (struct ip6_hdr *) (mbufc + sizeof(struct ether_header));
@@ -750,9 +749,9 @@ static void *vps_pkt_mangler_thread(void * arg)
             *seq_no                 = pkt_seq_no++;
             active_if_cnt[active_if]++;
             active_if               = (active_if + 1) % 2;
-            if (active_if_cnt[active_if] == if_ratio[active_if]) {
+            if (active_if_cnt[active_if] == if_config[active_if].if_ratio) {
                 active_if           = (active_if + 1) % 2;
-                if (active_if_cnt[active_if] == if_ratio[active_if]) {
+                if (active_if_cnt[active_if] == if_config[active_if].if_ratio) {
                     active_if_cnt[0] = active_if_cnt[1] = 0;
                     active_if       = (active_if + 1) % 2;
                 }
@@ -772,11 +771,11 @@ static void *vps_pkt_mangler_thread(void * arg)
             iphdr->ip_len           = iphdr->ip_len - sizeof(struct in_addr) - 1;
             iphdr->ip_sum           = iphdr_checksum((unsigned short*)(mbufc + sizeof(struct ether_header)), (sizeof(struct iphdr)/2));
 #endif            
-            if_ratio[0]             = *if_ratios >> 4;
-            if_ratio[1]             = *if_ratios & 0xF;
+            if_config[0].if_ratio   = if_ratios[0];
+            if_config[1].if_ratio   = if_ratios[1];
         }
-        circular_buffer_push(if_txq[EGRESS_IF].if_pkts, mbuf);
-        sem_post(&if_txq[EGRESS_IF].if_ready);
+        circular_buffer_push(if_config[EGRESS_IF].if_txq.if_pkts, mbuf);
+        sem_post(&if_config[EGRESS_IF].if_txq.if_ready);
     }
 
     thread_exit_rc = 0;
@@ -797,8 +796,8 @@ static void create_one_thread(int thread_idx)
             case 1:
             case 2:
                 snprintf(dsl_threads[thread_idx].thread_name, 16, "rx_thread%02d", thread_idx);
-                if ((rc = create_thread(&dsl_threads[thread_idx].thread_id, rx_thread, RXPRIO, dsl_threads[thread_idx].thread_name, (void *) &if_rxq[thread_idx])) != 0) {
-                    log_msg(LOG_ERR, "%s-%d: Can not create rx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_name[thread_idx], strerror(rc));
+                if ((rc = create_thread(&dsl_threads[thread_idx].thread_id, rx_thread, RXPRIO, dsl_threads[thread_idx].thread_name, (void *) &if_config[thread_idx].if_rxq)) != 0) {
+                    log_msg(LOG_ERR, "%s-%d: Can not create rx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[thread_idx].if_name, strerror(rc));
                     exit_level1_cleanup();
                     exit(rc);
                 }
@@ -807,8 +806,8 @@ static void create_one_thread(int thread_idx)
             case 4:
             case 5:
                 snprintf(dsl_threads[thread_idx].thread_name, 16, "tx_thread%02d", thread_idx);
-                if ((rc = create_thread(&dsl_threads[thread_idx].thread_id, tx_thread, TXPRIO, dsl_threads[thread_idx].thread_name, (void *) &if_txq[thread_idx-3])) != 0) {
-                    log_msg(LOG_ERR, "%s-%d: Can not create tx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_name[thread_idx-3], strerror(rc));
+                if ((rc = create_thread(&dsl_threads[thread_idx].thread_id, tx_thread, TXPRIO, dsl_threads[thread_idx].thread_name, (void *) &if_config[thread_idx-3].if_txq)) != 0) {
+                    log_msg(LOG_ERR, "%s-%d: Can not create tx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[thread_idx-3].if_name, strerror(rc));
                     exit_level1_cleanup();
                     exit(rc);
                 }
@@ -834,16 +833,16 @@ static void create_one_thread(int thread_idx)
         switch (thread_idx) {
             case 0:
                 snprintf(dsl_threads[0].thread_name, 16, "rx_thread");
-                if ((rc = create_thread(&dsl_threads[0].thread_id, rx_thread, RXPRIO, dsl_threads[0].thread_name, (void *) &if_rxq[EGRESS_IF])) != 0) {
-                    log_msg(LOG_ERR, "%s-%d: Can not create rx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_name[EGRESS_IF], strerror(rc));
+                if ((rc = create_thread(&dsl_threads[0].thread_id, rx_thread, RXPRIO, dsl_threads[0].thread_name, (void *) &if_config[EGRESS_IF].if_rxq)) != 0) {
+                    log_msg(LOG_ERR, "%s-%d: Can not create rx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[EGRESS_IF].if_name, strerror(rc));
                     exit_level1_cleanup();
                     exit(rc);
                 }
                 break;
             case 1:
                 snprintf(dsl_threads[1].thread_name, 16, "tx_thread");
-                if ((rc = create_thread(&dsl_threads[1].thread_id, tx_thread, TXPRIO, dsl_threads[1].thread_name, (void *) &if_txq[EGRESS_IF])) != 0) {
-                    log_msg(LOG_ERR, "%s-%d: Can not create tx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_name[EGRESS_IF], strerror(rc));
+                if ((rc = create_thread(&dsl_threads[1].thread_id, tx_thread, TXPRIO, dsl_threads[1].thread_name, (void *) &if_config[EGRESS_IF].if_txq)) != 0) {
+                    log_msg(LOG_ERR, "%s-%d: Can not create tx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[EGRESS_IF].if_name, strerror(rc));
                     exit_level1_cleanup();
                     exit(rc);
                 }
@@ -890,26 +889,26 @@ static int reconnect_comms_to_server(void)
         log_msg(LOG_ERR, "%s-%d: Can not create socket for server connection - %s\n", __FUNCTION__, __LINE__, strerror(errno));
         return errno;
     }
-    peer_addr.sin6_port     = htons((unsigned short)cc_port);
+    peer_addr.sin6_port     = htons((unsigned short)rmt_port);
     ifr.ifr_addr.sa_family  = peer_addr.sin6_family;
     inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&peer_addr), s, sizeof s);
 #else    
     if ((comms_peer_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
         log_msg(LOG_ERR, "%s-&d: Can not create socket for server connection - %s\n", __FUNCTION__, __LINE__, strerror(errno));
         return errno;
-    }
-    peer_addr.sin_port      = htons((unsigned short)cc_port);
+        }
+    peer_addr.sin_port      = htons((unsigned short)rmt_port);
     ifr.ifr_addr.sa_family  = peer_addr.sin_family;
     inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&peer_addr), s, sizeof s);
 #endif
-    strncpy(ifr.ifr_name, if_brname[EGRESS_IF], sizeof(ifr.ifr_name));
-    // Bind raw socket to the primary egress bridge (eg: egressbr0)
+    strncpy(ifr.ifr_name, if_config[EGRESS_IF].if_name, sizeof(ifr.ifr_name));
+    // Bind raw socket to the primary egress interface (eg: ppp0)
     if (setsockopt(comms_peer_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
         rc = errno;
         log_msg(LOG_ERR, "%s-%d: Can not bind comms peer socket to %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
         exit_level1_cleanup();
         exit(rc);
-    }
+        }
     log_msg(LOG_INFO, "Waiting for connection to server at %s...\n", s);
     if (connect(comms_peer_fd, (struct sockaddr *) &peer_addr, sizeof(peer_addr)) == -1) {
         log_msg(LOG_INFO, "Not connected - %s.\n", strerror(errno));
@@ -934,11 +933,11 @@ static int handle_client_query(struct comms_query_s *query, int comms_client_fd,
         if (peer_addr_valid) {
             query->for_peer = false;
             while(((rc=send(comms_peer_fd, query, sizeof(struct comms_query_s), 0)) == -1) && (errno == EINTR));
-            if (rc == -1) {
+                if (rc == -1) {
                 log_msg(LOG_WARNING, "%s-%d: Could net send message to peer - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
             } else {
                 while(((rc = recv(comms_peer_fd, &reply, sizeof(struct comms_reply_s), 0)) == -1) && (errno == EINTR));
-            }
+                }
             if (rc == -1) reply.rc = errno;
             else reply.rc = 0;
         } else {
@@ -959,8 +958,8 @@ static int handle_client_query(struct comms_query_s *query, int comms_client_fd,
                 memcpy(&if_stats.client_sa[1], &query->helo_data.egress_addr[1], sizeof(struct sockaddr_in));
 #endif
                 if_stats.client_connected   = true;
-                if_ratio[0]                 = query->helo_data.if_ratio[0];
-                if_ratio[1]                 = query->helo_data.if_ratio[1];
+                if_config[0].if_ratio       = query->helo_data.if_ratio[0];
+                if_config[1].if_ratio       = query->helo_data.if_ratio[1];
                 cc_port                     = query->helo_data.cc_port;
                 reply.rc                    = 0;
 #ifdef IPV6
@@ -972,7 +971,7 @@ static int handle_client_query(struct comms_query_s *query, int comms_client_fd,
 #endif
                 log_msg(LOG_INFO, "HELO received.");
                 log_msg(LOG_INFO, "Client address1: %s  Client address2: %s.\n", client_ip_str[0], client_ip_str[1]);
-                log_msg(LOG_INFO, "IF ratio1: %u  IF ratio2: %u  Port: %u", if_ratio[0], if_ratio[1], cc_port);
+                log_msg(LOG_INFO, "IF ratio1: %u  IF ratio2: %u  Port: %u", if_config[0].if_ratio, if_config[1].if_ratio, cc_port);
                 if ((cliserv == SERVER) && (!peer_addr_valid)) {
                     memcpy(&peer_addr, &client_addr[0], sizeof(peer_addr));
                     reconnect_comms_to_server();
@@ -983,12 +982,12 @@ static int handle_client_query(struct comms_query_s *query, int comms_client_fd,
                 if_stats.mempool_overheadsz                     = mempool_overheadSz(mPool);
                 if_stats.mempool_totalsz                        = mempool_totalSz(mPool);
                 for (i=0; i<if_stats.num_interfaces; i++) {
-                    if_stats.circular_buffer_rxq_freesz[i]      = circular_buffer_freesz(if_rxq[i].if_pkts);
-                    if_stats.circular_buffer_txq_freesz[i]      = circular_buffer_freesz(if_txq[i].if_pkts);
-                    if_stats.circular_buffer_rxq_overheadsz[i]  = circular_buffer_overheadsz(if_rxq[i].if_pkts);
-                    if_stats.circular_buffer_txq_overheadsz[i]  = circular_buffer_overheadsz(if_txq[i].if_pkts);
-                    if_stats.circular_buffer_rxq_sz[i]          = circular_buffer_sz(if_rxq[i].if_pkts);
-                    if_stats.circular_buffer_txq_sz[i]          = circular_buffer_sz(if_txq[i].if_pkts);
+                    if_stats.circular_buffer_rxq_freesz[i]      = circular_buffer_freesz(if_config[i].if_rxq.if_pkts);
+                    if_stats.circular_buffer_txq_freesz[i]      = circular_buffer_freesz(if_config[i].if_txq.if_pkts);
+                    if_stats.circular_buffer_rxq_overheadsz[i]  = circular_buffer_overheadsz(if_config[i].if_rxq.if_pkts);
+                    if_stats.circular_buffer_txq_overheadsz[i]  = circular_buffer_overheadsz(if_config[i].if_txq.if_pkts);
+                    if_stats.circular_buffer_rxq_sz[i]          = circular_buffer_sz(if_config[i].if_rxq.if_pkts);
+                    if_stats.circular_buffer_txq_sz[i]          = circular_buffer_sz(if_config[i].if_txq.if_pkts);
                 }
                 memcpy(&reply.stats, &if_stats, sizeof(struct statistics_s));
                 reply.rc    = 0;
@@ -1034,7 +1033,7 @@ static int handle_client_query(struct comms_query_s *query, int comms_client_fd,
 // +----------------------------------------------------------------------------
 // | Thread to handle communication channel, one spawned for each connection
 // +----------------------------------------------------------------------------
-void *comms_thread(void *arg)
+static void *comms_thread(void *arg)
 {
     struct comms_thread_parms_s *thread_parms  = (struct comms_thread_parms_s *) arg;
     bool                        connection_active;
@@ -1059,21 +1058,177 @@ void *comms_thread(void *arg)
 
 
 // +----------------------------------------------------------------------------
+// | Create comms channel
+// +----------------------------------------------------------------------------
+static void create_comms_channel(unsigned int port, int *commsfd)
+{
+    int                         rc;
+#ifdef IPV6
+    struct sockaddr_in6         bind_addr;
+#else
+    struct sockaddr_in          bind_addr;
+#endif
+    
+    bzero((char *) &bind_addr, sizeof(bind_addr));
+#ifdef IPV6
+    if ((*commsfd = socket(AF_INET6, SOCK_STREAM, 0)) == -1) {
+        rc = errno;
+        log_msg(LOG_ERR, "%s-%d: Error creating comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
+        exit_level1_cleanup();
+        exit(rc);
+    }
+    bind_addr.sin6_family   = AF_INET6;
+    bind_addr.sin6_addr     = in6addr_any;
+    bind_addr.sin6_port     = htons((unsigned short)port);
+#else    
+    if ((*commsfd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+        rc = errno;
+        log_msg(LOG_ERR, "%s-%d: Error creating comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
+        close(*commsfd);
+        exit_level1_cleanup();
+        exit(rc);
+    }
+    bind_addr.sin_family        = AF_INET;
+    bind_addr.sin_addr.s_addr   = htonl(INADDR_ANY);
+    bind_addr.sin_port          = htons((unsigned short)port);
+#endif
+    if (setsockopt(*commsfd, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int)) == -1) {
+        log_msg(LOG_WARNING, "%s-%d: Error setting reuse address on comms socket.\n", __FUNCTION__, __LINE__);
+    }
+    if (bind(*commsfd, (struct sockaddr *) &bind_addr, sizeof(bind_addr)) == -1) {
+        rc = errno;
+        log_msg(LOG_ERR, "%s-%d: Can not bind comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
+        close(*commsfd);
+        exit_level1_cleanup();
+        exit(rc);
+    }
+
+    if (listen(*commsfd, 5) == -1) {
+        rc = errno;
+        log_msg(LOG_ERR, "%s-%d: Can not listen on comms socket - %s.\n", __FUNCTION__, __LINE__, rc);
+        close(*commsfd);
+        exit_level1_cleanup();
+        exit(rc);
+    }
+}
+
+// +----------------------------------------------------------------------------
+// | Thread to handle remote communication channel
+// +----------------------------------------------------------------------------
+static void *remote_comms_thread(void *arg)
+{
+    struct comms_thread_parms_s *thread_parms  = (struct comms_thread_parms_s *) arg;
+    int                         comms_client_fd;
+    char                        ipaddr[INET6_ADDRSTRLEN];
+    struct comms_thread_parms_s *comms_thread_parms;
+    socklen_t                   sin_size;
+    int                         rc;
+#ifdef IPV6
+    struct sockaddr_in6         comms_client_addr;
+#else
+    struct sockaddr_in          comms_client_addr;
+#endif
+
+    for(;;) {
+        if ((comms_client_fd = accept(thread_parms->peer_fd, (struct sockaddr *)&comms_client_addr, &sin_size)) < 0) {
+            log_msg(LOG_ERR, "%s-%d: Error accepting comms connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            continue;
+        }
+#ifdef IPV6
+        inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&comms_client_addr), ipaddr, sizeof ipaddr);
+#else
+        inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&comms_client_addr), ipaddr, sizeof ipaddr);
+#endif
+        log_msg(LOG_INFO, "Accepted connection from %s.\n", ipaddr);
+        if ((comms_thread_parms = (struct comms_thread_parms_s *) malloc(sizeof(struct comms_thread_parms_s))) == NULL) {
+            log_msg(LOG_ERR, "%s-%d: Out of memory.\n", __FUNCTION__, __LINE__);
+            close(comms_client_fd);
+            continue;
+        }
+        comms_thread_parms->peer_fd = comms_client_fd;
+        if ((rc = create_thread(&comms_thread_parms->thread_id, comms_thread, 1, "comms_thread", (void *) comms_thread_parms)) != 0) {
+            log_msg(LOG_ERR, "%s-%d: Can not create comms thread for connection from %s - %s.\n", __FUNCTION__, __LINE__, ipaddr, strerror(rc));
+        }
+    }
+    pthread_exit(NULL);
+}
+
+
+// +----------------------------------------------------------------------------
+// | Read the config file and set all the appropriate variables from the values.
+// +----------------------------------------------------------------------------
+static void read_config_file(void)
+{
+    config_t                cfg;
+    const config_setting_t  *config_egress_list;
+    const char              *config_string;
+    
+    config_init(&cfg);
+    
+    if (!config_read_file(&cfg, config_file_name)) {
+        log_msg(LOG_ERR, "%s-%d: Error reading config file, all parameters revert to defaults.\n", __FUNCTION__, __LINE__);
+        return;
+    }
+    
+    if (config_lookup_int(&cfg, "is_server", &cliserv))
+        log_msg(LOG_INFO, "Configured for %s mode.\n", cliserv == SERVER ? "server" : "client");
+    else {
+        cliserv = CLIENT;
+        log_msg(LOG_INFO, "Configured for client mode.\n");
+    }
+    if (config_lookup_int(&cfg, "port", &cc_port))
+        log_msg(LOG_INFO, "Configured for comms port on %d.\n", cc_port);
+    if (config_lookup_int(&cfg, "remote_port", &rmt_port))
+        log_msg(LOG_INFO, "Configured for remote comms port on %d.\n", rmt_port);
+    if (config_lookup_int(&cfg, "mbufs", &n_mbufs))
+        log_msg(LOG_INFO, "Configured for %d mbufs.\n", n_mbufs);
+    if (cliserv == CLIENT) {
+        if (config_lookup_string(&cfg, "client.ingress.tap", &config_string)) {
+            ingresscnt = 1;
+            strcpy(if_config[INGRESS_IF].if_name, config_string);
+            log_msg(LOG_INFO, "Configured for client ingress tap on %s.\n", if_config[INGRESS_IF].if_name);
+        }
+        if (config_lookup_string(&cfg, "client.ingress.bridge", &config_string)) {
+            strcpy(if_config[INGRESS_IF].if_brname, config_string);
+            log_msg(LOG_INFO, "Configured for client ingress bridge on %s.\n", if_config[INGRESS_IF].if_brname);
+        } else ingresscnt = 0;
+        if (config_lookup_string(&cfg, "client.server_name", &config_string)) {
+            strcpy(remote_name, config_string);
+            log_msg(LOG_INFO, "Configured for server name %s.\n", remote_name);
+        }
+        config_egress_list = config_lookup(&cfg, "client.egress.interface");
+        if (config_setting_length(config_egress_list) == 2) {
+            egresscnt = 2;
+            strcpy(if_config[EGRESS_IF].if_name, config_setting_get_string_elem(config_egress_list, 0));
+            strcpy(if_config[EGRESS_IF+1].if_name, config_setting_get_string_elem(config_egress_list, 1));
+            log_msg(LOG_INFO, "Configured for client egress interfaces on %s and %s.\n", if_config[EGRESS_IF].if_name, if_config[EGRESS_IF+1].if_name);
+        }
+    } else {
+        if (config_lookup_string(&cfg, "server.interface", &config_string)) {
+            strcpy(if_config[EGRESS_IF].if_name, config_string);
+            egresscnt = 1;
+            log_msg(LOG_INFO, "Configured for server interface on %s.\n", if_config[EGRESS_IF].if_name);
+        }
+    }
+    
+    config_destroy(&cfg);
+}
+
+
+// +----------------------------------------------------------------------------
 // | Main processing.
 // +----------------------------------------------------------------------------
 int main(int argc, char *argv[])
 {
-    int                         option, i, rc, commsfd, comms_client_fd;
+    int                         option, i, rc, commsfd, rmt_commsfd, comms_client_fd;
     bool                        daemonize = true;
     pid_t                       pid, sid;
     struct sigaction            sigact;
-    char                        *remote_name;
-    unsigned int                n_mbufs=DEFAULT_NUM_MBUFS;
     struct sched_param          sparam;
 #ifdef IPV6
-    struct sockaddr_in6         bind_addr, comms_client_addr;
+    struct sockaddr_in6         comms_client_addr;
 #else
-    struct sockaddr_in          bind_addr, comms_client_addr;
+    struct sockaddr_in          comms_client_addr;
 #endif
     struct sigevent             se;
     socklen_t                   sin_size;
@@ -1082,19 +1237,19 @@ int main(int argc, char *argv[])
     struct comms_thread_parms_s *comms_thread_parms;
     struct comms_query_s        client_query;
     struct comms_reply_s        client_response;
-    
+    struct ifreq                ifr;
+
     i=0;
     if (argv[0][0] == '.' || argv[0][0] == '/') i++;
     if (argv[0][1] == '.' || argv[0][1] == '/') i++;
     progname = &argv[0][i];
+    
+    memset(config_file_name, 0, PATH_MAX);
+    strcpy(config_file_name, DEFAULT_CONFIG_FILE_NAME);
 
-    memset(if_name, 0, sizeof(if_name));
-    memset(if_prefix, 0, sizeof(if_name));
-    memset(if_brname, 0, sizeof(if_name));
-    memset(if_ipaddr, 0, sizeof(if_ipaddr));
     for (i=0; i<NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES; i++) {
-        if_fd[i]        = 0;
-        if_ratio[i]     = 1;
+        memset(&if_config[i], 0, sizeof(struct if_config_s));
+        if_config[i].if_ratio     = 1;
     }
     memset(&if_stats, 0, sizeof(struct statistics_s));
     memset(dsl_threads, 0, sizeof(struct thread_list_s)*9);
@@ -1107,7 +1262,7 @@ int main(int argc, char *argv[])
     sigaction(SIGINT, &sigact, NULL);
 
     // Check command line options
-    while((option = getopt(argc, argv, "i:e:p:sc:n:hdf")) > 0) {
+    while((option = getopt(argc, argv, "c:hdf")) > 0) {
         switch(option) {
             case 'd':
                 debug = true;
@@ -1118,60 +1273,14 @@ int main(int argc, char *argv[])
             case 'h':
                 usage(progname);
                 break;
-            case 'p':
-                sscanf(optarg, "%u", &cc_port);
-                break;
-            case 'n':
-                sscanf(optarg, "%u", &n_mbufs);
-                break;
-            case 's':
-                cliserv     = SERVER;
-                ingresscnt  = 0;
-                egresscnt   = 1;
-                break;
             case 'c':
-                cliserv     = CLIENT;
-                ingresscnt  = 1;
-                egresscnt   = 2;
-                if ((remote_name = malloc(strlen(optarg)+1)) == NULL) exit(ENOMEM);
-                memset(remote_name, 0, strlen(optarg)+1);
-                strncpy(remote_name, optarg, strlen(optarg));
-                break;
-            case 'i':
-                strncpy(if_prefix[INGRESS_IF], optarg, IFNAMSIZ);
-                break;
-            case 'e':
-                strncpy(if_prefix[EGRESS_IF], optarg, IFNAMSIZ-1);
+                strncpy(config_file_name, optarg, strlen(optarg)+1);
                 break;
             default:
                 printf("Unknown option %c\n", option);
                 usage(progname);
                 exit(EINVAL);
         }
-    }
-
-    if (cliserv == -1) {
-        printf("You must provide either -c or -s option.\n\n");
-        usage(progname);
-        exit(EINVAL);
-    }
-
-    if (cliserv == CLIENT && strlen(remote_name) == 0) {
-        printf("You must provide a server ip or name.\n\n");
-        usage(progname);
-        exit(EINVAL);
-    }
-
-    if (cliserv == CLIENT && strlen(if_prefix[INGRESS_IF]) == 0) {
-        printf("You must provide an ingress interface name on the client.\n\n");
-        usage(progname);
-        exit(EINVAL);
-    }
-
-    if (strlen(if_prefix[EGRESS_IF]) == 0) {
-        printf("You must provide an egress interface name.\n\n");
-        usage(progname);
-        exit(EINVAL);
     }
 
     // daemonize
@@ -1206,22 +1315,36 @@ int main(int argc, char *argv[])
         log_init(debug, true, progname);
     else
         log_init(debug, false, progname);
+    
+    // configure this instance of the program
+    read_config_file();
+
+    // do some sanity checks
+    if (cliserv == -1) {
+        log_msg(LOG_ERR, "You must define server or client mode in config file.\n\n");
+        exit(EINVAL);
+    }
+
+    if (cliserv == CLIENT && strlen(remote_name) == 0) {
+        log_msg(LOG_ERR, "You must provide a server ip or name in config file.\n\n");
+        exit(EINVAL);
+    }
+
+    if (cliserv == CLIENT && ingresscnt == 0) {
+        log_msg(LOG_ERR, "You must provide an ingress interface name in the config file.\n\n");
+        exit(EINVAL);
+    }
+
+    if (egresscnt == 0) {
+        log_msg(LOG_ERR, "You must provide an egress interface name in the config file.\n\n");
+        exit(EINVAL);
+    }
 
     // Switch to real time scheduler
     sparam.sched_priority = sched_get_priority_min(SCHED_RR);
     if (sched_setscheduler(getpid(), SCHED_RR, &sparam) == -1) {
         log_msg(LOG_WARNING, "%s-%d: Set scheduler returns %s, continuing on SCHED_OTHER.\n",
                 __FUNCTION__, __LINE__, strerror(errno));
-    }
-    
-    // Generate interface and bridge names
-    if (ingresscnt) {
-        sprintf(if_name[INGRESS_IF], "%s", if_prefix[INGRESS_IF]);
-        sprintf(if_brname[INGRESS_IF], "%sbr", if_prefix[INGRESS_IF]);
-    }
-    for (i=0; i<egresscnt; i++) {
-        sprintf(if_name[i], "%s%1d", if_prefix[EGRESS_IF], i);
-        sprintf(if_brname[i], "%sbr%1d", if_prefix[EGRESS_IF], i);
     }
 
     // Allocate the memory pool for mbufs
@@ -1235,56 +1358,74 @@ int main(int argc, char *argv[])
     // two egress interfaces on the home gateway, and one on the vps
     for (i=0; i<egresscnt; i++) {
         // Open raw socket for egress interface
-        if ((if_fd[i] = tuntap_init(if_name[i])) < 0) {
+#ifdef IPV6
+        if ((if_config[i].if_tx_fd = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW)) < 0) {
+#else
+        if ((if_config[i].if_tx_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0) {
+#endif
             rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not create egress interface %s - %s.\n", __FUNCTION__, __LINE__, if_name[i], strerror(errno));
+            log_msg(LOG_ERR, "%s-%d: Can not create socket for egress interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        } else if_config[i].if_rx_fd = if_config[i].if_tx_fd;
+        memset(&ifr, 0, sizeof(ifr));
+#ifdef IPV6
+        ifr.ifr_addr.sa_family = AF_INET6;
+#else        
+        ifr.ifr_addr.sa_family = AF_INET;
+#endif
+        strncpy(ifr.ifr_name, if_config[i].if_name, sizeof(ifr.ifr_name));
+        // Bind raw socket to a particular interface name (eg: ppp0 or ppp1)
+        if (setsockopt(if_config[i].if_tx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Can not bind socket to %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
             exit_level1_cleanup();
             exit(rc);
         }
         // Setup the rx queue
-        if_rxq[i].if_index  = i;
-        if_rxq[i].if_thread = &dsl_threads[i*2];
+        if_config[i].if_rxq.if_index  = i;
+        if_config[i].if_rxq.if_thread = &dsl_threads[i*2];
         if (i == 0) {
             // Only create one circular buffer and semaphore for both rx queues
-            if ((if_rxq[i].if_pkts = circular_buffer_create(n_mbufs/(ingresscnt+egresscnt), mPool)) == CIRCULAR_BUFFER_INVALID) {
+            if ((if_config[i].if_rxq.if_pkts = circular_buffer_create(n_mbufs/(ingresscnt+egresscnt), mPool)) == CIRCULAR_BUFFER_INVALID) {
                 log_msg(LOG_ERR, "%s-%d: Failure to create rx circular buffer for index %d.\n", __FUNCTION__, __LINE__, i);
                 exit_level1_cleanup();
                 exit(ENOMEM);
             }
-            if (sem_init(&if_rxq[i].if_ready, 0, 0) == -1) {
+            if (sem_init(&if_config[i].if_rxq.if_ready, 0, 0) == -1) {
                 rc = errno;
                 log_msg(LOG_ERR, "%s-%d: Failure to create rx queue semaphore for index %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
                 exit_level1_cleanup();
                 exit(rc);
             }
         } else {
-            if_rxq[i].if_pkts   = if_rxq[0].if_pkts;
-            if_rxq[i].if_ready  = if_rxq[0].if_ready;
+            if_config[i].if_rxq.if_pkts   = if_config[0].if_rxq.if_pkts;
+            if_config[i].if_rxq.if_ready  = if_config[0].if_rxq.if_ready;
         }
         // Set up the tx queue
-        if_txq[i].if_index  = i;
-        if_txq[i].if_thread = &dsl_threads[(i*2)+1];
+        if_config[i].if_txq.if_index  = i;
+        if_config[i].if_txq.if_thread = &dsl_threads[(i*2)+1];
         // Each tx interface has it's own circular buffer and semaphore, unlike the rx interfaces
-        if ((if_txq[i].if_pkts = circular_buffer_create(n_mbufs/(ingresscnt+egresscnt), mPool)) == CIRCULAR_BUFFER_INVALID) {
+        if ((if_config[i].if_txq.if_pkts = circular_buffer_create(n_mbufs/(ingresscnt+egresscnt), mPool)) == CIRCULAR_BUFFER_INVALID) {
             log_msg(LOG_ERR, "%s-%d: Failure to create tx circular buffer for index %d.\n", __FUNCTION__, __LINE__, i);
             exit_level1_cleanup();
             exit(ENOMEM);
         }
-        if (sem_init(&if_txq[i].if_ready, 0, 0) == -1) {
+        if (sem_init(&if_config[i].if_txq.if_ready, 0, 0) == -1) {
             rc = errno;
             log_msg(LOG_ERR, "%s-%d: Failure to create tx queue semaphore for index %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
             exit_level1_cleanup();
             exit(rc);
         }
     }
-    
+
     // Get ip addrs of all interfaces
     if (getifaddrs(&ifa) == -1) {
-        rc = errno;
+            rc = errno;
         log_msg(LOG_ERR, "%s-%d: Failure to get interface ip addresses - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-        exit_level1_cleanup();
-        exit(rc);
-    }
+            exit_level1_cleanup();
+            exit(rc);
+        }
     ifa_p = ifa;
     while (ifa_p) {
         if ((ifa_p->ifa_addr) && ((ifa_p->ifa_addr->sa_family == AF_INET) ||
@@ -1292,57 +1433,99 @@ int main(int argc, char *argv[])
 #ifdef IPV6
             if (ifa_p->ifa_addr->sa_family == AF_INET6) {
                 for (i=0; i<egresscnt+ingresscnt; i++) {
-                    if (strcmp(if_brname[i], ifa_p->ifa_name) == 0) {
-                        memcpy(&if_ipaddr[i], ifa_p->ifa_addr, sizeof(struct sockaddr_in6));
-                        inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&if_ipaddr[i]), ipaddr, sizeof(ipaddr));
-                        log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_name[i], ipaddr);
+                    if (i == INGRESS_IF) {
+                        if (strcmp(if_config[i].if_brname, ifa_p->ifa_name) == 0) {
+                            memcpy(&if_config[i].if_ipaddr, ifa_p->ifa_addr, sizeof(struct sockaddr_in6));
+                            inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&if_config[i].if_ipaddr), ipaddr, sizeof(ipaddr));
+                            log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_config[i].if_brname, ipaddr);
+                        }
+                    } else {
+                        if (strcmp(if_config[i].if_name, ifa_p->ifa_name) == 0) {
+                            memcpy(&if_config[i].if_ipaddr, ifa_p->ifa_addr, sizeof(struct sockaddr_in6));
+                            inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&if_config[i].if_ipaddr), ipaddr, sizeof(ipaddr));
+                            log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_config[i].if_name, ipaddr);
+                        }
                     }
                 }
             }
 #else
             if (ifa_p->ifa_addr->sa_family == AF_INET) {
                 for (i=0; i<egresscnt+ingresscnt; i++) {
-                    if (strcmp(if_brname[i], ifa_p->ifa_name) == 0) {
-                        memcpy(&if_ipaddr[i], ifa_p->ifa_addr, sizeof(struct sockaddr_in));
-                        inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&if_ipaddr[i]), ipaddr, sizeof(ipaddr));
-                        log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_name[i], ipaddr);
+                    if (i == INGRESS_IF) {
+                        if (strcmp(if_config[i].if_brname, ifa_p->ifa_name) == 0) {
+                            memcpy(&if_config[i].if_ipaddr, ifa_p->ifa_addr, sizeof(struct sockaddr_in));
+                            inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&if_config[i].if_ipaddr), ipaddr, sizeof(ipaddr));
+                            log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_config[i].if_brname, ipaddr);
+                        }
+                    } else {
+                        if (strcmp(if_config[i].if_name, ifa_p->ifa_name) == 0) {
+                            memcpy(&if_config[i].if_ipaddr, ifa_p->ifa_addr, sizeof(struct sockaddr_in));
+                            inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&if_config[i].if_ipaddr), ipaddr, sizeof(ipaddr));
+                            log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_config[i].if_name, ipaddr);
+                        }
                     }
                 }
-            } 
+            }
 #endif
         }
         ifa_p = ifa_p->ifa_next;
     }
 
     if (cliserv == CLIENT) {
-        // Open ingress interface
-        if ((if_fd[INGRESS_IF] = tuntap_init(if_name[INGRESS_IF])) < 0) {
+        // Open ingress rx tap interface
+        if ((if_config[INGRESS_IF].if_rx_fd = tuntap_init(if_config[INGRESS_IF].if_name)) < 0) {
             exit_level1_cleanup();
-            exit(-1*if_fd[INGRESS_IF]);
+            exit(-1*if_config[INGRESS_IF].if_rx_fd);
+        }
+        // Open raw socket for ingress tx interface
+#ifdef IPV6
+        if ((if_config[INGRESS_IF].if_tx_fd = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW)) < 0)
+#else
+        if ((if_config[INGRESS_IF].if_tx_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0)
+#endif
+        {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Can not create socket for ingress interface - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        }
+        memset(&ifr, 0, sizeof(ifr));
+#ifdef IPV6
+        ifr.ifr_addr.sa_family = AF_INET6;
+#else        
+        ifr.ifr_addr.sa_family = AF_INET;
+#endif
+        strncpy(ifr.ifr_name, if_config[INGRESS_IF].if_brname, sizeof(ifr.ifr_name));
+        // Bind raw socket to the ingress bridge
+        if (setsockopt(if_config[INGRESS_IF].if_tx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Can not bind socket to %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
         }
 
         // Create the rx and tx queues for ingress interface
-        if_rxq[INGRESS_IF].if_index  = INGRESS_IF;
-        if_rxq[INGRESS_IF].if_thread = &dsl_threads[4];
-        if ((if_rxq[INGRESS_IF].if_pkts   = circular_buffer_create(n_mbufs/(ingresscnt+egresscnt), mPool)) == CIRCULAR_BUFFER_INVALID) {
+        if_config[INGRESS_IF].if_rxq.if_index  = INGRESS_IF;
+        if_config[INGRESS_IF].if_rxq.if_thread = &dsl_threads[4];
+        if ((if_config[INGRESS_IF].if_rxq.if_pkts   = circular_buffer_create(n_mbufs/(ingresscnt+egresscnt), mPool)) == CIRCULAR_BUFFER_INVALID) {
             log_msg(LOG_ERR, "%s-%d: Failure to create rx circular buffer for index 0.\n", __FUNCTION__, __LINE__);
             exit_level1_cleanup();
             exit(ENOMEM);
         }
-        if (sem_init(&if_rxq[INGRESS_IF].if_ready, 0, 0) == -1) {
+        if (sem_init(&if_config[INGRESS_IF].if_rxq.if_ready, 0, 0) == -1) {
             rc = errno;
             log_msg(LOG_ERR, "%s-%d: Failure to create rx queue semaphore for index 0 - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
             exit_level1_cleanup();
             exit(rc);
         }
-        if_txq[INGRESS_IF].if_index  = INGRESS_IF;
-        if_txq[INGRESS_IF].if_thread = &dsl_threads[5];
-        if ((if_txq[INGRESS_IF].if_pkts   = circular_buffer_create(n_mbufs/(ingresscnt+egresscnt), mPool)) == CIRCULAR_BUFFER_INVALID) {
+        if_config[INGRESS_IF].if_txq.if_index  = INGRESS_IF;
+        if_config[INGRESS_IF].if_txq.if_thread = &dsl_threads[5];
+        if ((if_config[INGRESS_IF].if_txq.if_pkts   = circular_buffer_create(n_mbufs/(ingresscnt+egresscnt), mPool)) == CIRCULAR_BUFFER_INVALID) {
             log_msg(LOG_ERR, "%s-%d: Failure to tx create circular buffer for index 0.\n", __FUNCTION__, __LINE__);
             exit_level1_cleanup();
             exit(ENOMEM);
         }
-        if (sem_init(&if_txq[INGRESS_IF].if_ready, 0, 0) == -1) {
+        if (sem_init(&if_config[INGRESS_IF].if_txq.if_ready, 0, 0) == -1) {
             rc = errno;
             log_msg(LOG_ERR, "%s-%d: Failure to create tx queue semaphore for index 0 - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
             exit_level1_cleanup();
@@ -1367,15 +1550,16 @@ int main(int argc, char *argv[])
 
         // Convert server name to server ip address
 #ifdef IPV6
-        if ((name_to_ip(remote_name, (struct sockaddr_storage *) &peer_addr, AF_INET6)) != 0) {
+        if ((name_to_ip(remote_name, (struct sockaddr_storage *) &peer_addr, AF_INET6)) != 0)
 #else        
-        if ((name_to_ip(remote_name, (struct sockaddr_storage *) &peer_addr, AF_INET)) != 0) {
-#endif            
+        if ((name_to_ip(remote_name, (struct sockaddr_storage *) &peer_addr, AF_INET)) != 0)
+#endif
+        {
             log_msg(LOG_ERR, "%s-%d: Could not translate hostname %s into ip address.\n", __FUNCTION__, __LINE__, remote_name);
             exit_level1_cleanup();
             exit(EINVAL);
         }
-        
+
         if ((rc = reconnect_comms_to_server()) != 0) {
             exit_level1_cleanup();
             exit(rc);
@@ -1383,11 +1567,11 @@ int main(int argc, char *argv[])
 
         // Handshake with server, send helo message and wait for ack.
 #ifdef IPV6
-        memcpy(&client_query.helo_data.egress_addr[0], &if_ipaddr[0], sizeof(struct sockaddr_in6));
-        memcpy(&client_query.helo_data.egress_addr[1], &if_ipaddr[1], sizeof(struct sockaddr_in6));
+        memcpy(&client_query.helo_data.egress_addr[0], &if_config[0].if_ipaddr, sizeof(struct sockaddr_in6));
+        memcpy(&client_query.helo_data.egress_addr[1], &if_config[1].if_ipaddr, sizeof(struct sockaddr_in6));
 #else
-        memcpy(&client_query.helo_data.egress_addr[0], &if_ipaddr[0], sizeof(struct sockaddr_in));
-        memcpy(&client_query.helo_data.egress_addr[1], &if_ipaddr[1], sizeof(struct sockaddr_in));
+        memcpy(&client_query.helo_data.egress_addr[0], &if_config[0].if_ipaddr, sizeof(struct sockaddr_in));
+        memcpy(&client_query.helo_data.egress_addr[1], &if_config[1].if_ipaddr, sizeof(struct sockaddr_in));
 #endif
         client_query.helo_data.if_ratio[0]      = 1;
         client_query.helo_data.if_ratio[1]      = 1;
@@ -1417,50 +1601,22 @@ int main(int argc, char *argv[])
         create_threads(3);
     }
 
-    // Open communication channel
-    bzero((char *) &bind_addr, sizeof(bind_addr));
-#ifdef IPV6
-    if ((commsfd = socket(AF_INET6, SOCK_STREAM, 0)) == -1) {
-        rc = errno;
-        log_msg(LOG_ERR, "%s-%d: Error creating comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
+    // Open local and remote communication channels
+    create_comms_channel(cc_port, &commsfd);
+    create_comms_channel(rmt_port, &rmt_commsfd);
+    if ((comms_thread_parms = (struct comms_thread_parms_s *) malloc(sizeof(struct comms_thread_parms_s))) == NULL) {
+        log_msg(LOG_ERR, "%s-%d: Out of memory.\n", __FUNCTION__, __LINE__);
         exit_level1_cleanup();
-        exit(rc);
+        exit(ENOMEM);
     }
-    bind_addr.sin6_family   = AF_INET6;
-    bind_addr.sin6_addr     = in6addr_any;
-    bind_addr.sin6_port     = htons((unsigned short)cc_port);
-#else    
-    if ((commsfd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-        rc = errno;
-        log_msg(LOG_ERR, "%s-%d: Error creating comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
-        exit_level1_cleanup();
-        exit(rc);
+    comms_thread_parms->peer_fd = rmt_commsfd;
+    if ((rc = create_thread(&comms_thread_parms->thread_id, remote_comms_thread, 1, "rmt_comms_thread", (void *) comms_thread_parms)) != 0) {
+        log_msg(LOG_ERR, "%s-%d: Can not create remote comms thread - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
     }
-    bind_addr.sin_family        = AF_INET;
-    bind_addr.sin_addr.s_addr   = htonl(INADDR_ANY);
-    bind_addr.sin_port          = htons((unsigned short)cc_port);
-#endif
-    if (setsockopt(commsfd, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int)) == -1) {
-        log_msg(LOG_WARNING, "%s-%d: Error setting reuse address on comms socket.\n", __FUNCTION__, __LINE__);
-    }
-    if (bind(commsfd, (struct sockaddr *) &bind_addr, sizeof(bind_addr)) == -1) {
-        rc = errno;
-        log_msg(LOG_ERR, "%s-%d: Can not bind comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
-        close(commsfd);
-        exit_level1_cleanup();
-        exit(rc);
-    }
-
-    if (listen(commsfd, 5) == -1) {
-        rc = errno;
-        log_msg(LOG_ERR, "%s-%d: Can not listen on comms socket - %s.\n", __FUNCTION__, __LINE__, rc);
-        exit_level1_cleanup();
-        exit(rc);
-    }
-    sin_size = sizeof(comms_client_addr);
 
     log_msg(LOG_INFO, "%s daemon started.\n", progname);
     
+    sin_size = sizeof(comms_client_addr);
     for(;;) {
         if ((comms_client_fd = accept(commsfd, (struct sockaddr *)&comms_client_addr, &sin_size)) < 0) {
             log_msg(LOG_ERR, "%s-%d: Error accepting comms connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
@@ -1480,7 +1636,6 @@ int main(int argc, char *argv[])
         comms_thread_parms->peer_fd = comms_client_fd;
         if ((rc = create_thread(&comms_thread_parms->thread_id, comms_thread, 1, "comms_thread", (void *) comms_thread_parms)) != 0) {
             log_msg(LOG_ERR, "%s-%d: Can not create comms thread for connection from %s - %s.\n", __FUNCTION__, __LINE__, ipaddr, strerror(rc));
-            close(comms_client_fd);
         }
     }
 

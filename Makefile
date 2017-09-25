@@ -5,10 +5,10 @@ CFLAGS6=-c -g -pthread -Werror -Wunused -Wuninitialized -DIPV6
 all: dslgateway dslgateway6 dslgateway_ui dslgateway_ui6
 	
 dslgateway: dslgateway.o circular_buffer.o mempool.o log.o util.o
-	gcc -g -pthread dslgateway.o circular_buffer.o mempool.o log.o util.o -o dslgateway -lrt
+	gcc -g -pthread dslgateway.o circular_buffer.o mempool.o log.o util.o -o dslgateway -lrt -lconfig
 	
 dslgateway6: dslgateway.6.o circular_buffer.o mempool.o log.o util.o
-	gcc -g -pthread dslgateway.6.o circular_buffer.o mempool.o log.o util.o -o dslgateway6 -lrt
+	gcc -g -pthread dslgateway.6.o circular_buffer.o mempool.o log.o util.o -o dslgateway6 -lrt -lconfig
 	
 dslgateway_ui: dslgateway_ui.o log.o util.o
 	gcc -g -pthread dslgateway_ui.o log.o util.o -o dslgateway_ui -lrt
