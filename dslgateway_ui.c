@@ -50,43 +50,77 @@
 #include <netinet/udp.h>
 #include <netinet/if_ether.h>
 #include <netinet/in.h>
+#include <libconfig.h>
+#include <limits.h>
 
 #include "comms.h"
 #include "util.h"
 
 static int                  comms_serv_fd;
-#ifdef IPV6
-static struct sockaddr_in6  host_addr;
-#else
+static struct sockaddr_in6  host_addr6;
 static struct sockaddr_in   host_addr;
-#endif
 static unsigned int         cc_port=PORT;
 static unsigned int         print_stats_delay=5;
 static unsigned int         remote_thread_start=0;
+static bool                 ipv6_mode=false;
+static char                 config_file_name[PATH_MAX];
+
+
+// +----------------------------------------------------------------------------
+// | Read the config file and set all the appropriate variables from the values.
+// +----------------------------------------------------------------------------
+static void read_config_file(void)
+{
+    config_t                cfg;
+    int                     i;
+
+    config_init(&cfg);
+
+    if (!config_read_file(&cfg, config_file_name)) {
+        printf("%s-%d: Error reading config file, all parameters revert to defaults.\n", __FUNCTION__, __LINE__);
+        return;
+    }
+
+    if (config_lookup_int(&cfg, "port", &cc_port))
+        printf("Configured for comms port on %d.\n", cc_port);
+    if (config_lookup_int(&cfg, "ipversion", &i)) {
+        if (i == 6) ipv6_mode = true;
+        printf("Configured for %s.\n", ipv6_mode ? "ipv6" : "ipv4");
+    }
+
+    config_destroy(&cfg);
+}
 
 // +----------------------------------------------------------------------------
 // | Connect to the client on the comms port
 // +----------------------------------------------------------------------------
 static int reconnect_comms_to_client(void)
 {
-#ifdef IPV6
-    if ((comms_serv_fd = socket(AF_INET6, SOCK_STREAM, 0)) < 0) {
-        printf("%s-%d: Can not create comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-        exit(EIO);
+    if (ipv6_mode) {
+        if ((comms_serv_fd = socket(AF_INET6, SOCK_STREAM, 0)) < 0) {
+            printf("%s-%d: Can not create comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            exit(EIO);
+        }
+        host_addr6.sin6_port       = htons((unsigned short)cc_port);
+    } else {
+        if ((comms_serv_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+            printf("%s-%d: Can not create comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            exit(EIO);
+        }
+        host_addr.sin_port        = htons((unsigned short)cc_port);
     }
-    host_addr.sin6_port       = htons((unsigned short)cc_port);
-#else
-    if ((comms_serv_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        printf("%s-%d: Can not create comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-        exit(EIO);
-    }
-    host_addr.sin_port        = htons((unsigned short)cc_port);
-#endif
     printf("Waiting for connection to server on port %u...", cc_port);
     fflush(stdout);
-    if (connect(comms_serv_fd, (struct sockaddr *) &host_addr, sizeof(host_addr)) < 0) {
-        printf(" Not connected - %s.\n", strerror(errno));
-        return errno;
+    if (ipv6_mode) {
+        if (connect(comms_serv_fd, (struct sockaddr *) &host_addr6, sizeof(host_addr6)) < 0) {
+            printf(" Not connected - %s.\n", strerror(errno));
+            return errno;
+        }
+    } else {
+        if (connect(comms_serv_fd, (struct sockaddr *) &host_addr, sizeof(host_addr)) < 0) {
+            printf(" Not connected - %s.\n", strerror(errno));
+            return errno;
+        }
     }
     printf("Connected.\n");
     return 0;
@@ -98,12 +132,12 @@ static int reconnect_comms_to_client(void)
 // +----------------------------------------------------------------------------
 void print_usage(void)
 {
-    printf("dslgateway_ui [-p <port>] [-r <hostname>] [-n <iterations>] [-d <delay>]\n");
+    printf("dslgateway_ui [-p <port>] [-r <hostname>] [-n <iterations>] [-d <delay>] [-6]\n");
     printf("dslgateway_ui -h: Print this help text\n");
-    printf("  -p <port>: Connect on port. Default is %d.\n", PORT);
-    printf("  -r <hostname>: Name of host to connect to. Default is localhost.\n");
-    printf("  -n <iterations>: Display stats for n iterations, then exit.\n");
-    printf("  -d <delay>: Delay between refresh of stats print.\n");
+    printf("  -c <config filename>: Full path to config file. Default is /etc/dslgateway.cfg.\n");
+    printf("  -r <hostname>:        Name of host to connect to. Default is localhost.\n");
+    printf("  -n <iterations>:      Display stats for n iterations, then exit.\n");
+    printf("  -d <delay>:           Delay between refresh of stats print.\n");
     printf("\n");
 }
 
@@ -130,7 +164,9 @@ void get_ip_str(const struct sockaddr *sa, char *s, size_t maxlen)
 
 static void print_stats(struct comms_reply_s *rply, char *name)
 {
-    char client_ip_str[2][INET6_ADDRSTRLEN];
+    char                client_ip_str[2][INET6_ADDRSTRLEN];
+    struct sockaddr_in6 *addr6;
+    struct sockaddr_in  *addr4;
 
     printf("\n%s interface statistics:\n", name);
     if (rply->stats.num_interfaces == 3) {
@@ -177,13 +213,17 @@ static void print_stats(struct comms_reply_s *rply, char *name)
         printf("Mempool total sz: %9u  free sz: %9u  overhead sz: %9u\n", rply->stats.mempool_totalsz,
                 rply->stats.mempool_freesz, rply->stats.mempool_overheadsz);
         if (rply->stats.client_connected) {
-#ifdef IPV6
-            inet_ntop(AF_INET6, &rply->stats.client_sa[0].sin6_addr, client_ip_str[0], INET6_ADDRSTRLEN);
-            inet_ntop(AF_INET6, &rply->stats.client_sa[1].sin6_addr, client_ip_str[1], INET6_ADDRSTRLEN);
-#else            
-            inet_ntop(AF_INET, &rply->stats.client_sa[0].sin_addr, client_ip_str[0], INET_ADDRSTRLEN);
-            inet_ntop(AF_INET, &rply->stats.client_sa[1].sin_addr, client_ip_str[1], INET_ADDRSTRLEN);
-#endif
+            if (ipv6_mode) {
+                addr6 = (struct sockaddr_in6 *) &rply->stats.client_sa[0];
+                inet_ntop(AF_INET6, &addr6->sin6_addr, client_ip_str[0], INET6_ADDRSTRLEN);
+                addr6 = (struct sockaddr_in6 *) &rply->stats.client_sa[1];
+                inet_ntop(AF_INET6, &addr6->sin6_addr, client_ip_str[1], INET6_ADDRSTRLEN);
+            } else {
+                addr4 = (struct sockaddr_in *) &rply->stats.client_sa[0];
+                inet_ntop(AF_INET, &addr4->sin_addr, client_ip_str[0], INET_ADDRSTRLEN);
+                addr4 = (struct sockaddr_in *) &rply->stats.client_sa[1];
+                inet_ntop(AF_INET, &addr4->sin_addr, client_ip_str[1], INET_ADDRSTRLEN);
+            }
             printf("Client is connected on %s and %s.\n", client_ip_str[0], client_ip_str[1]);
         } else {
             printf("Client is not connected.\n");
@@ -320,45 +360,50 @@ int main(int argc, char *argv[])
 
     memset(hostname, 0, 256);
     sprintf(hostname, "%s", "localhost");
+    memset(config_file_name, 0, PATH_MAX);
+    strcpy(config_file_name, "/etc/dslgateway.cfg");
 
     // Parse the options
-    while ((opt = getopt(argc, argv, "p:n:r:d:h?")) != -1) {
-      switch (opt) {
-        case 'p':
-            sscanf(optarg, "%u", &cc_port);
-            break;
-        case 'n':
-            sscanf(optarg, "%u", &iter);
-            break;
-        case 'd':
-            sscanf(optarg, "%u", &print_stats_delay);
-            break;
-        case 'r':
-            sscanf(optarg, "%s", hostname);
-            break;
-        case 'h':
-        case '?':
-            print_usage();
-            exit(0);
-        default:
-            printf("%c option is invalid, ignored.\n", opt);
-      }
+    while ((opt = getopt(argc, argv, "c:n:r:d:h?")) != -1) {
+        switch (opt) {
+            case 'c':
+                strcpy(config_file_name, optarg);
+                break;
+            case 'n':
+                sscanf(optarg, "%u", &iter);
+                break;
+            case 'd':
+                sscanf(optarg, "%u", &print_stats_delay);
+                break;
+            case 'r':
+                sscanf(optarg, "%s", hostname);
+                break;
+            case 'h':
+            case '?':
+                print_usage();
+                exit(0);
+            default:
+                printf("%c option is invalid, ignored.\n", opt);
+        }
     }
+    
+    // read config dile
+    read_config_file();
 
     // Convert host name to ip address
-#ifdef IPV6
-    if (name_to_ip(hostname, (struct sockaddr_storage *) &host_addr, AF_INET6) != 0) {
-#else
-    if (name_to_ip(hostname, (struct sockaddr_storage *) &host_addr, AF_INET) != 0) {
-#endif
-        printf("Invalid host name.\n");
-        exit(EINVAL);
+    if (ipv6_mode) {
+        if (name_to_ip(hostname, (struct sockaddr_storage *) &host_addr6, AF_INET6) != 0) {
+            printf("Invalid host name.\n");
+            exit(EINVAL);
+        }
+        inet_ntop(AF_INET6, &host_addr6.sin6_addr, ipaddr, sizeof(ipaddr));
+    } else {
+        if (name_to_ip(hostname, (struct sockaddr_storage *) &host_addr, AF_INET) != 0) {
+            printf("Invalid host name.\n");
+            exit(EINVAL);
+        }
+        inet_ntop(AF_INET, &host_addr.sin_addr, ipaddr, sizeof(ipaddr));
     }
-#ifdef IPV6
-    inet_ntop(AF_INET6, &host_addr.sin6_addr, ipaddr, sizeof(ipaddr));
-#else
-    inet_ntop(AF_INET, &host_addr.sin_addr, ipaddr, sizeof(ipaddr));
-#endif
     printf("Connecting to ip address %s.\n", ipaddr);
 
     // Connect to host

@@ -43,40 +43,34 @@ extern "C" {
 #define COMMS_EXIT              7
 
 struct statistics_s {
-    char                if_name[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES][IFNAMSIZ+1];
-    unsigned long long  if_rx_pkts[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned long long  if_tx_pkts[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned long long  if_rx_bytes[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned long long  if_tx_bytes[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned long long  if_dropped_pkts[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned int        mempool_totalsz;
-    unsigned int        mempool_freesz;
-    unsigned int        mempool_overheadsz;
-    unsigned int        circular_buffer_rxq_sz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned int        circular_buffer_rxq_freesz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned int        circular_buffer_rxq_overheadsz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned int        circular_buffer_txq_sz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned int        circular_buffer_txq_freesz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned int        circular_buffer_txq_overheadsz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned int        num_interfaces;
-    unsigned long long  reorders;
-    unsigned long long  reorder_failures;
-#ifdef IPV6
-    struct sockaddr_in6 client_sa[2];
-#else
-    struct sockaddr_in  client_sa[2];
-#endif
-    bool                client_connected;
+    char                    if_name[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES][IFNAMSIZ+1];
+    unsigned long long      if_rx_pkts[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
+    unsigned long long      if_tx_pkts[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
+    unsigned long long      if_rx_bytes[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
+    unsigned long long      if_tx_bytes[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
+    unsigned long long      if_dropped_pkts[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
+    unsigned int            mempool_totalsz;
+    unsigned int            mempool_freesz;
+    unsigned int            mempool_overheadsz;
+    unsigned int            circular_buffer_rxq_sz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
+    unsigned int            circular_buffer_rxq_freesz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
+    unsigned int            circular_buffer_rxq_overheadsz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
+    unsigned int            circular_buffer_txq_sz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
+    unsigned int            circular_buffer_txq_freesz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
+    unsigned int            circular_buffer_txq_overheadsz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
+    unsigned int            num_interfaces;
+    unsigned long long      reorders;
+    unsigned long long      reorder_failures;
+    struct sockaddr_storage client_sa[2];
+    bool                    client_connected;
+    bool                    ipv6_mode;
 };
 
 struct comms_helo_data_s {
-#ifdef IPV6
-    struct sockaddr_in6 egress_addr[NUM_EGRESS_INTERFACES];
-#else    
-    struct sockaddr_in  egress_addr[NUM_EGRESS_INTERFACES];
-#endif    
-    unsigned long       if_ratio[NUM_EGRESS_INTERFACES];
-    unsigned int        cc_port;
+    struct sockaddr_storage egress_addr[NUM_EGRESS_INTERFACES];
+    unsigned long           if_ratio[NUM_EGRESS_INTERFACES];
+    unsigned int            cc_port;
+    bool                    ipv6_mode;
 };
 
 struct comms_query_s {
