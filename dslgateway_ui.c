@@ -59,7 +59,7 @@
 static int                  comms_serv_fd;
 static struct sockaddr_in6  host_addr6;
 static struct sockaddr_in   host_addr;
-static unsigned int         cc_port=PORT;
+static int                  cc_port=-1;
 static unsigned int         print_stats_delay=5;
 static unsigned int         remote_thread_start=0;
 static bool                 ipv6_mode=false;
@@ -81,8 +81,9 @@ static void read_config_file(void)
         return;
     }
 
-    if (config_lookup_int(&cfg, "port", &cc_port))
-        printf("Configured for comms port on %d.\n", cc_port);
+    if (cc_port == -1)
+        if (config_lookup_int(&cfg, "port", &cc_port))
+            printf("Configured for comms port on %d.\n", cc_port);
     if (config_lookup_int(&cfg, "ipversion", &i)) {
         if (i == 6) ipv6_mode = true;
         printf("Configured for %s.\n", ipv6_mode ? "ipv6" : "ipv4");
@@ -132,10 +133,11 @@ static int reconnect_comms_to_client(void)
 // +----------------------------------------------------------------------------
 void print_usage(void)
 {
-    printf("dslgateway_ui [-p <port>] [-r <hostname>] [-n <iterations>] [-d <delay>] [-6]\n");
+    printf("dslgateway_ui [-c <config filename>] [-r <hostname>] [-p <port>] [-n <iterations>] [-d <delay>] [-6]\n");
     printf("dslgateway_ui -h: Print this help text\n");
     printf("  -c <config filename>: Full path to config file. Default is /etc/dslgateway.cfg.\n");
     printf("  -r <hostname>:        Name of host to connect to. Default is localhost.\n");
+    printf("  -p <port>:            Port to connect to. Default is from config file.\n");
     printf("  -n <iterations>:      Display stats for n iterations, then exit.\n");
     printf("  -d <delay>:           Delay between refresh of stats print.\n");
     printf("\n");
@@ -364,13 +366,16 @@ int main(int argc, char *argv[])
     strcpy(config_file_name, "/etc/dslgateway.cfg");
 
     // Parse the options
-    while ((opt = getopt(argc, argv, "c:n:r:d:h?")) != -1) {
+    while ((opt = getopt(argc, argv, "c:n:r:d:p:h?")) != -1) {
         switch (opt) {
             case 'c':
                 strcpy(config_file_name, optarg);
                 break;
             case 'n':
                 sscanf(optarg, "%u", &iter);
+                break;
+            case 'p':
+                sscanf(optarg, "%u", &cc_port);
                 break;
             case 'd':
                 sscanf(optarg, "%u", &print_stats_delay);
@@ -389,6 +394,7 @@ int main(int argc, char *argv[])
     
     // read config dile
     read_config_file();
+    if (cc_port == -1) cc_port=PORT;
 
     // Convert host name to ip address
     if (ipv6_mode) {
