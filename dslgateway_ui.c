@@ -349,6 +349,21 @@ static void kill_daemons(void)
 
 
 // +----------------------------------------------------------------------------
+// +----------------------------------------------------------------------------
+static void send_qcontrol(char *command)
+{
+    struct comms_query_s qry;
+    struct comms_reply_s rply;
+
+    sscanf(&command[9], "%d %d", &qry.q_control_index, &qry.q_control_cnt);
+    qry.cmd         = COMMS_SET_QCONTROL;
+    qry.for_peer    = false;
+    send(comms_serv_fd, &qry, sizeof(struct comms_query_s), 0);
+    recv(comms_serv_fd, &rply, sizeof(struct comms_reply_s), 0);
+}
+
+
+// +----------------------------------------------------------------------------
 // | Main processing.
 // +----------------------------------------------------------------------------
 int main(int argc, char *argv[])
@@ -391,7 +406,7 @@ int main(int argc, char *argv[])
                 printf("%c option is invalid, ignored.\n", opt);
         }
     }
-    
+
     // read config dile
     read_config_file();
     if (cc_port == -1) cc_port=PORT;
@@ -461,6 +476,11 @@ int main(int argc, char *argv[])
             kill_daemons();
             continue;
         }
+        if (strncmp(command, "qcontrol", 8) == 0) {
+            send_qcontrol(command);
+            continue;
+        }
         printf("Commands: stats, threads, stop <threadno>, start <threadno>, exit, kill\n");
+        printf("          qcontrol <index> <value>\n");
     }
 }

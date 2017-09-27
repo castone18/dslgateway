@@ -168,6 +168,8 @@ struct if_queue_s {
     circular_buffer         if_pkts;
     sem_t                   if_ready;
     struct thread_list_s    *if_thread;
+    unsigned int            q_control_cnt;
+    bool                    q_control;
 };
 
 struct comms_thread_parms_s {
@@ -215,6 +217,7 @@ static char                     config_file_name[PATH_MAX];
 static unsigned int             n_mbufs=DEFAULT_NUM_MBUFS;
 static char                     *remote_name=NULL;
 static bool                     ipv6_mode=false;
+static bool                     q_control_on=false;
 
 
 
@@ -408,9 +411,19 @@ static void *rx_thread(void * arg)
         mbuf->if_index = rxq->if_index;
         switch (mbuf->pkt.tcp_pkt.tap_hdr.tap_proto) {
             case ETHERTYPE_IPV6:
+                if (!ipv6_mode) {
+                    // not ipv6 mode so drop the packet
+                    if_stats.if_dropped_pkts[rxq->if_index]++;
+                    continue;
+                }
                 mbuf->ipv6 = true;
                 break;
             case ETHERTYPE_IP:
+                if (ipv6_mode) {
+                    // not ipv4 mode so drop the packet
+                    if_stats.if_dropped_pkts[rxq->if_index]++;
+                    continue;
+                }
                 mbuf->ipv6 = false;
                 break;
             default:
@@ -456,6 +469,16 @@ static void *rx_thread(void * arg)
                 mbuf->for_home = false;
                 if ((cliserv == SERVER) && (iphdr->ip_dst.s_addr == client_addr4[i]->sin_addr.s_addr) || (iphdr->ip_dst.s_addr == client_addr4[i]->sin_addr.s_addr)) mbuf->for_home = true;
             }
+        }
+
+        // For debugging purposes, we have queue control that will only let a set number
+        // of packets through
+        if (rxq->q_control) {
+            if (!rxq->q_control_cnt) {
+                if_stats.if_dropped_pkts[rxq->if_index]++;
+                continue;
+            }
+            rxq->q_control_cnt--;
         }
 
         // Accept the packet
@@ -880,20 +903,20 @@ static int create_threads(int thread_cnt)
 // +----------------------------------------------------------------------------
 static int reconnect_comms_to_server(void)
 {
-    char            s[INET6_ADDRSTRLEN], rmt_port_str[6];
+    char            s[INET6_ADDRSTRLEN], rmt_port_str[7];
     struct addrinfo hints, *result, *rp;
     int             rc;
 
     log_debug_msg(LOG_INFO, "%s-%d\n", __FUNCTION__, __LINE__);
     close(comms_peer_fd);
-    
+
     memset(&hints, 0, sizeof(struct addrinfo));
     hints.ai_family     = AF_UNSPEC;
     hints.ai_socktype   = SOCK_STREAM;
     hints.ai_flags      = 0;
     hints.ai_protocol   = 0;
-    memset(rmt_port_str, 0, 6);
-    sprintf(rmt_port_str, "%5u", rmt_port);
+    memset(rmt_port_str, 0, 7);
+    snprintf(rmt_port_str, 6, "%u", rmt_port);
     if ((rc = getaddrinfo(remote_name, rmt_port_str, &hints, &result)) != 0) {
         log_msg(LOG_ERR, "%s-%d: getaddrinfo error - %s", __FUNCTION__, __LINE__, gai_strerror(rc));
         return rc;
@@ -911,12 +934,13 @@ static int reconnect_comms_to_server(void)
             log_msg(LOG_INFO, "Not connected - %s.\n", strerror(errno));
             continue;
         }
+        log_msg(LOG_INFO, "Connected to %s.\n", s);
+        break;
     }
+    freeaddrinfo(result);
     if (rp == NULL)
         return rc;
 
-    freeaddrinfo(result);
-    log_msg(LOG_INFO, "Connected to %s.\n", s);    
     peer_addr_valid = true;
     return 0;
 }
@@ -1020,6 +1044,15 @@ static int handle_client_query(struct comms_query_s *query, int comms_client_fd,
                 break;
             case COMMS_EXIT:
                 *connection_active  = false;
+                break;
+            case COMMS_SET_QCONTROL:
+                if (query->q_control_cnt == -1) {
+                    if_config[query->q_control_index].if_rxq.q_control      = false;
+                } else {
+                    if_config[query->q_control_index].if_rxq.q_control_cnt  = query->q_control_cnt;
+                    if_config[query->q_control_index].if_rxq.q_control      = true;
+                }
+                reply.rc            = 0;
                 break;
             default:
                 reply.rc    = -1;
@@ -1197,6 +1230,10 @@ static void read_config_file(void)
     if (config_lookup_int(&cfg, "ipversion", &i)) {
         if (i == 6) ipv6_mode = true;
         log_msg(LOG_INFO, "Configured for %s.\n", ipv6_mode ? "ipv6" : "ipv4");
+    }
+    if (config_lookup_bool(&cfg, "qcontrol", &i)) {
+        q_control_on = i;
+        log_msg(LOG_INFO, "Configured for debugging queue control %s.\n", q_control_on ? "on" : "off");
     }
     if (cliserv == CLIENT) {
         if (config_lookup_string(&cfg, "client.ingress.tap", &config_string)) {
@@ -1446,6 +1483,10 @@ int main(int argc, char *argv[])
             if_config[i].if_rxq.if_pkts   = if_config[0].if_rxq.if_pkts;
             if_config[i].if_rxq.if_ready  = if_config[0].if_rxq.if_ready;
         }
+        if (q_control_on) {
+            if_config[i].if_rxq.q_control       = true;
+            if_config[i].if_rxq.q_control_cnt   = 0;
+        } else if_config[i].if_rxq.q_control    = false;
         // Set up the tx queue
         if_config[i].if_txq.if_index  = i;
         if_config[i].if_txq.if_thread = &dsl_threads[(i*2)+1];
@@ -1461,6 +1502,10 @@ int main(int argc, char *argv[])
             exit_level1_cleanup();
             exit(rc);
         }
+        if (q_control_on) {
+            if_config[i].if_txq.q_control       = true;
+            if_config[i].if_txq.q_control_cnt   = 0;
+        } else if_config[i].if_txq.q_control    = false;
     }
 
     // Get ip addrs of all interfaces
@@ -1551,6 +1596,10 @@ int main(int argc, char *argv[])
             exit_level1_cleanup();
             exit(rc);
         }
+        if (q_control_on) {
+            if_config[INGRESS_IF].if_rxq.q_control       = true;
+            if_config[INGRESS_IF].if_rxq.q_control_cnt   = 0;
+        } else if_config[INGRESS_IF].if_rxq.q_control    = false;
         if_config[INGRESS_IF].if_txq.if_index  = INGRESS_IF;
         if_config[INGRESS_IF].if_txq.if_thread = &dsl_threads[5];
         if ((if_config[INGRESS_IF].if_txq.if_pkts   = circular_buffer_create(n_mbufs/(ingresscnt+egresscnt), mPool)) == CIRCULAR_BUFFER_INVALID) {
@@ -1564,6 +1613,10 @@ int main(int argc, char *argv[])
             exit_level1_cleanup();
             exit(rc);
         }
+        if (q_control_on) {
+            if_config[INGRESS_IF].if_txq.q_control       = true;
+            if_config[INGRESS_IF].if_txq.q_control_cnt   = 0;
+        } else if_config[INGRESS_IF].if_txq.q_control    = false;
 
         // Create timer to handle reorder buffer timeouts
         se.sigev_notify             = SIGEV_THREAD;

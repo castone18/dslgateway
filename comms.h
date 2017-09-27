@@ -38,6 +38,7 @@ extern "C" {
 #define COMMS_GETSTATS          1
 #define COMMS_STOPTHREAD        2
 #define COMMS_STARTTHREAD       3
+#define COMMS_SET_QCONTROL      4
 #define COMMS_LISTTHREADS       5
 #define COMMS_KILL              6
 #define COMMS_EXIT              7
@@ -78,6 +79,8 @@ struct comms_query_s {
     bool                        for_peer;
     struct comms_helo_data_s    helo_data;
     unsigned int                num_thread;
+    int                         q_control_cnt;
+    int                         q_control_index;
 };
 
 struct comms_reply_s {
