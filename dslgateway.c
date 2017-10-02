@@ -201,11 +201,9 @@ static unsigned int             reorder_if_cnt[2] = {0, 0};
 static struct sockaddr_storage  client_addr[NUM_EGRESS_INTERFACES];
 static struct sockaddr_in6      peer_addr6;
 static struct sockaddr_in       peer_addr;
-static struct sockaddr_in6      comms_addr6;
-static struct sockaddr_in       comms_addr;
 static struct sockaddr_in6      *client_addr6[NUM_EGRESS_INTERFACES] = {(struct sockaddr_in6 *) &client_addr[0], (struct sockaddr_in6 *) &client_addr[1]};
 static struct sockaddr_in       *client_addr4[NUM_EGRESS_INTERFACES] = {(struct sockaddr_in *) &client_addr[0], (struct sockaddr_in *) &client_addr[1]};
-static bool                     peer_addr_valid=false;
+static bool                     comms_addr_valid=false, client_addr_valid=false;
 static bool                     debug=false;
 static char                     config_file_name[PATH_MAX];
 static unsigned int             n_mbufs=DEFAULT_NUM_MBUFS;
@@ -376,7 +374,7 @@ static void *rx_thread(void * arg)
         }
         mbufc = (unsigned char *) mbuf;
         clock_gettime(CLOCK_MONOTONIC, &mbuf->rx_time);
-        
+
         // ignore packets from egress interfaces with if_ratio = 0
         if ((rxq->if_index == EGRESS_IF || rxq->if_index == EGRESS_IF+1) && if_config[rxq->if_index].if_ratio == 0) {
             if_stats.if_dropped_pkts[rxq->if_index]++;
@@ -400,6 +398,10 @@ static void *rx_thread(void * arg)
                     continue;
                 }
             } else {  //server
+                if (!client_addr_valid) {
+                    if_stats.if_dropped_pkts[rxq->if_index]++;
+                    continue;
+                }
                 if (ip6hdr->ip6_src.s6_addr[11] == 0xFF && ip6hdr->ip6_src.s6_addr[12] == 0xFE) {
                     // this packet came from home gateway
                     mbuf->for_home = false;
@@ -416,7 +418,13 @@ static void *rx_thread(void * arg)
                     continue;
                 }
                 mbuf->for_home = false;
-                if ((cliserv == SERVER) && (iphdr->ip_dst.s_addr == client_addr4[i]->sin_addr.s_addr) || (iphdr->ip_dst.s_addr == client_addr4[i]->sin_addr.s_addr)) mbuf->for_home = true;
+                if (cliserv == SERVER) {
+                    if (!client_addr_valid) {
+                        if_stats.if_dropped_pkts[rxq->if_index]++;
+                        continue;
+                    }
+                    if ((iphdr->ip_dst.s_addr == client_addr4[i]->sin_addr.s_addr) || (iphdr->ip_dst.s_addr == client_addr4[i]->sin_addr.s_addr)) mbuf->for_home = true;
+                }
             }
         }
 
@@ -863,7 +871,7 @@ static int reconnect_comms_to_server(void)
     hints.ai_protocol   = 0;
     memset(rmt_port_str, 0, 7);
     snprintf(rmt_port_str, 6, "%u", rmt_port);
-    if ((rc = getaddrinfo(remote_name, rmt_port_str, &hints, &result)) != 0) {
+    if ((rc = getaddrinfo(comms_name, rmt_port_str, &hints, &result)) != 0) {
         log_msg(LOG_ERR, "%s-%d: getaddrinfo error - %s", __FUNCTION__, __LINE__, gai_strerror(rc));
         return rc;
     }
@@ -917,7 +925,7 @@ static int reconnect_comms_to_server(void)
 //    }
 //    log_msg(LOG_INFO, "Connected.\n");
 
-    peer_addr_valid = true;
+    comms_addr_valid = true;
     return 0;
 }
 
@@ -932,7 +940,7 @@ static int handle_client_query(struct comms_query_s *query, int comms_client_fd,
     char                    client_ip_str[2][INET6_ADDRSTRLEN];
 
     if (query->for_peer) {
-        if (peer_addr_valid) {
+        if (comms_addr_valid) {
             query->for_peer = false;
             while(((rc=send(comms_peer_fd, query, sizeof(struct comms_query_s), 0)) == -1) && (errno == EINTR));
                 if (rc == -1) {
@@ -963,6 +971,7 @@ static int handle_client_query(struct comms_query_s *query, int comms_client_fd,
                     inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&client_addr[0]), client_ip_str[0], INET6_ADDRSTRLEN);
                     inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&client_addr[1]), client_ip_str[1], INET6_ADDRSTRLEN);
                 }
+                client_addr_valid           = true;
                 if_stats.client_connected   = true;
                 if_config[0].if_ratio       = query->helo_data.if_ratio[0];
                 if_config[1].if_ratio       = query->helo_data.if_ratio[1];
@@ -971,11 +980,7 @@ static int handle_client_query(struct comms_query_s *query, int comms_client_fd,
                 log_msg(LOG_INFO, "HELO received.");
                 log_msg(LOG_INFO, "Client address1: %s  Client address2: %s.\n", client_ip_str[0], client_ip_str[1]);
                 log_msg(LOG_INFO, "IF ratio1: %u  IF ratio2: %u  Port: %u", if_config[0].if_ratio, if_config[1].if_ratio, cc_port);
-                if ((cliserv == SERVER) && (!peer_addr_valid)) {
-                    if (ipv6_mode)
-                        memcpy(&peer_addr6, &client_addr[0], sizeof(struct sockaddr_in6));
-                    else
-                        memcpy(&peer_addr, &client_addr[0], sizeof(struct sockaddr_in));
+                if (cliserv == SERVER) {
                     reconnect_comms_to_server();
                 }
                 break;
@@ -1372,6 +1377,11 @@ int main(int argc, char *argv[])
         exit(EINVAL);
     }
 
+    if ((comms_name == NULL) || (strlen(comms_name) == 0)) {
+        log_msg(LOG_ERR, "You must provide a comms ip or dns name in config file.\n\n");
+        exit(EINVAL);
+    }
+
     if (cliserv == CLIENT && ingresscnt == 0) {
         log_msg(LOG_ERR, "You must provide an ingress interface name in the config file.\n\n");
         exit(EINVAL);
@@ -1399,7 +1409,7 @@ int main(int argc, char *argv[])
     // allocate rx and tx circular buffers for egress interfaces. Note there are
     // two egress interfaces on the home gateway, and one on the vps
     for (i=0; i<egresscnt; i++) {
-        // Open raw socket for egress tx interface, opened in IP mode so we don't have to 
+        // Open raw socket for egress tx interface, opened in IP mode so we don't have to
         // provide the ethernet header.
         if (ipv6_mode) {
             if ((if_config[i].if_tx_fd = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW)) < 0) {
@@ -1541,25 +1551,8 @@ int main(int argc, char *argv[])
         ifa_p = ifa_p->ifa_next;
     }
 
-    // Convert comms name to comms ip address
-    if (ipv6_mode) {
-        if ((name_to_ip(comms_name, (struct sockaddr_storage *) &comms_addr6, AF_INET6)) != 0)
-        {
-            log_msg(LOG_ERR, "%s-%d: Could not translate hostname %s into ip address.\n", __FUNCTION__, __LINE__, remote_name);
-            exit_level1_cleanup();
-            exit(EINVAL);
-        }
-    } else {
-        if ((name_to_ip(comms_name, (struct sockaddr_storage *) &comms_addr, AF_INET)) != 0)
-        {
-            log_msg(LOG_ERR, "%s-%d: Could not translate hostname %s into ip address.\n", __FUNCTION__, __LINE__, remote_name);
-            exit_level1_cleanup();
-            exit(EINVAL);
-        }
-    }
-
     if (cliserv == CLIENT) {
-        // Open raw socket for inress tx interface, opened in IP mode so we don't have to 
+        // Open raw socket for inress tx interface, opened in IP mode so we don't have to
         // provide the ethernet header.
         if (ipv6_mode) {
             if ((if_config[INGRESS_IF].if_tx_fd = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW)) < 0) {
