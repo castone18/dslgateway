@@ -122,13 +122,7 @@
 #define VPS_PKT_MANGLER_THREADNO            2
 #define DEFAULT_CONFIG_FILE_NAME            "/etc/dslgateway.cfg"
 
-struct tap_hdr_s {
-    uint16_t            tap_flags;
-    uint16_t            tap_proto;
-};
-
 struct tcp_mbuf_s {
-    struct tap_hdr_s    tap_hdr;
     struct ether_header eth_hdr;
     struct ip           ip_hdr;
     struct tcphdr       tcp_hdr;
@@ -136,7 +130,6 @@ struct tcp_mbuf_s {
 };
 
 struct udp_mbuf_s {
-    struct tap_hdr_s    tap_hdr;
     struct ether_header eth_hdr;
     struct ip           ip_hdr;
     struct udphdr       udp_hdr;
@@ -181,7 +174,6 @@ struct if_config_s {
     int                     if_rx_fd;
     int                     if_tx_fd;
     char                    if_name[IFNAMSIZ];
-    char                    if_brname[IFNAMSIZ];
     struct if_queue_s       if_rxq;
     struct if_queue_s       if_txq;
     uint8_t                 if_ratio;
@@ -196,7 +188,7 @@ static mempool                  mPool;
 static bool                     wipebufs=false;
 static uint8_t                  pkt_seq_no=0;
 static int                      cliserv=-1;
-static int                      comms_peer_fd;
+static int                      comms_peer_fd=-1;
 static struct statistics_s      if_stats;
 static unsigned int             cc_port=PORT, rmt_port=PORT;
 static struct thread_list_s     dsl_threads[((NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES)*2)+2];
@@ -206,69 +198,21 @@ static struct mbuf_s            *reorder_buf[REORDER_BUF_SZ];
 static timer_t                  reorder_buf_timerid;
 static struct itimerspec        reorder_buf_intvl;
 static unsigned int             reorder_if_cnt[2] = {0, 0};
-static struct sockaddr_storage  peer_addr, client_addr[NUM_EGRESS_INTERFACES];
-static struct sockaddr_in6      *peer_addr6 = (struct sockaddr_in6 *) &peer_addr;
-static struct sockaddr_in       *peer_addr4 = (struct sockaddr_in *) &peer_addr;
+static struct sockaddr_storage  client_addr[NUM_EGRESS_INTERFACES];
+static struct sockaddr_in6      peer_addr6;
+static struct sockaddr_in       peer_addr;
+static struct sockaddr_in6      comms_addr6;
+static struct sockaddr_in       comms_addr;
 static struct sockaddr_in6      *client_addr6[NUM_EGRESS_INTERFACES] = {(struct sockaddr_in6 *) &client_addr[0], (struct sockaddr_in6 *) &client_addr[1]};
 static struct sockaddr_in       *client_addr4[NUM_EGRESS_INTERFACES] = {(struct sockaddr_in *) &client_addr[0], (struct sockaddr_in *) &client_addr[1]};
 static bool                     peer_addr_valid=false;
 static bool                     debug=false;
 static char                     config_file_name[PATH_MAX];
 static unsigned int             n_mbufs=DEFAULT_NUM_MBUFS;
-static char                     *remote_name=NULL;
+static char                     *remote_name=NULL, *comms_name=NULL;
 static bool                     ipv6_mode=false;
 static bool                     q_control_on=false;
 
-
-
-// +----------------------------------------------------------------------------
-// | Deletes a tuntap interface.
-// +----------------------------------------------------------------------------
-//static void tuntap_exit(char *dev, int fd)
-//{
-//    if (ioctl(fd, TUNSETPERSIST, 0) < 0) {
-//        log_msg(LOG_ERR, "%s-%d: Error deleting tuntap device %s - %s\n", __FUNCTION__, __LINE__, dev, strerror(errno));
-//    }
-//    close(fd);
-//}
-
-
-// +----------------------------------------------------------------------------
-// | Opens a tap interface. Returns fd of tap interface.
-// +----------------------------------------------------------------------------
-static int tuntap_init(char *ifname)
-{
-    struct ifreq    ifr;
-    int             fd, rc;
-
-    if (ifname == NULL) return -1*EINVAL;
-
-    log_debug_msg(LOG_INFO, "%s-%d: Opening %s device.\n", __FUNCTION__, __LINE__, ifname);
-
-    if( (fd = open("/dev/net/tun" , O_RDWR)) < 0 ) {
-        log_msg(LOG_ERR, "%s-%d: Error opening /dev/net/tun - %s\n", __FUNCTION__, __LINE__, strerror(errno));
-        return -1*errno;
-    }
-
-    memset(&ifr, 0, sizeof(ifr));
-    ifr.ifr_flags = IFF_TAP;
-
-    if (strlen(ifname) > 0) {
-        strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
-    }
-
-    if((rc = ioctl(fd, TUNSETIFF, (void *)&ifr)) < 0) {
-        rc = -1*errno;
-        log_msg(LOG_ERR, "%s-%d: Error with ioctl(TUNSETIFF) - %s\n", __FUNCTION__, __LINE__, strerror(errno));
-        close(fd);
-        return rc;
-    }
-    if (strcmp(ifname, ifr.ifr_name) != 0)
-        strncpy(ifname, ifr.ifr_name, IFNAMSIZ);
-    log_debug_msg(LOG_INFO, "%s-%d: Opened %s device.\n", __FUNCTION__, __LINE__, ifr.ifr_name);
-
-    return fd;
-}
 
 
 // +----------------------------------------------------------------------------
@@ -409,7 +353,7 @@ static void *rx_thread(void * arg)
             continue;
         }
         mbuf->if_index = rxq->if_index;
-        switch (mbuf->pkt.tcp_pkt.tap_hdr.tap_proto) {
+        switch (mbuf->pkt.tcp_pkt.eth_hdr.ether_type) {
             case ETHERTYPE_IPV6:
                 if (!ipv6_mode) {
                     // not ipv6 mode so drop the packet
@@ -431,8 +375,13 @@ static void *rx_thread(void * arg)
                 continue;
         }
         mbufc = (unsigned char *) mbuf;
-        mbufc += sizeof(struct tap_hdr_s);  // position past the bytes added by the tap interface
         clock_gettime(CLOCK_MONOTONIC, &mbuf->rx_time);
+        
+        // ignore packets from egress interfaces with if_ratio = 0
+        if ((rxq->if_index == EGRESS_IF || rxq->if_index == EGRESS_IF+1) && if_config[rxq->if_index].if_ratio == 0) {
+            if_stats.if_dropped_pkts[rxq->if_index]++;
+            continue;
+        }
 
         // ignore broadcast packets
         ethhdr = (struct ether_header *) mbufc;
@@ -512,7 +461,6 @@ static void *tx_thread(void * arg)
         while ((sem_wait(&txq->if_ready) == -1) && (errno == EINTR));
         if ((mbuf = (struct mbuf_s*) circular_buffer_pop(txq->if_pkts)) == NULL) continue;
         mbufc   = (unsigned char *) mbuf;
-        mbufc   += sizeof(struct tap_hdr_s);
         if (mbuf->ipv6) {
             ip6hdr   = (struct ip6_hdr *) (mbufc + sizeof (struct ether_header));
             // TODO: deal with partial packet send
@@ -567,7 +515,6 @@ static void *home_to_vps_pkt_mangler_thread(void * arg)
         sem_wait(&if_config[INGRESS_IF].if_rxq.if_ready);
         if ((mbuf = circular_buffer_pop(if_config[INGRESS_IF].if_rxq.if_pkts)) == NULL) continue;
         mbufc                   = (unsigned char *) mbuf;
-        mbufc                   += sizeof(struct tap_hdr_s);
         // Save the destination address at the end of the packet. Also save the if_ratios
         // in one byte at the end of the packet. Increase packet length by the length
         // of the destination address plus 1 byte for if_ratios. Replace destination
@@ -577,14 +524,14 @@ static void *home_to_vps_pkt_mangler_thread(void * arg)
             sv_dest_addr6           = (struct in6_addr *) (mbufc + sizeof(struct ether_header) + sizeof(struct ip6_hdr) + ip6hdr->ip6_plen);
             memcpy(sv_dest_addr6, &ip6hdr->ip6_dst, sizeof(struct in6_addr));
             if_ratios               = (uint8_t *) (mbufc + sizeof(struct ether_header) + sizeof(struct ip6_hdr) + ip6hdr->ip6_plen + sizeof(struct in6_addr));
-            memcpy(&ip6hdr->ip6_dst, &peer_addr6->sin6_addr, sizeof(struct in6_addr));
+            memcpy(&ip6hdr->ip6_dst, &peer_addr6.sin6_addr, sizeof(struct in6_addr));
             ip6hdr->ip6_plen        = ip6hdr->ip6_plen + sizeof(struct in6_addr) + 2;
         } else {
             iphdr                   = (struct ip *) (mbufc + sizeof(struct ether_header));
             sv_dest_addr            = (struct in_addr *) (mbufc + sizeof(struct ether_header) + iphdr->ip_len);
             memcpy(sv_dest_addr, &iphdr->ip_dst, sizeof(struct in_addr));
             if_ratios               = (uint8_t *) (mbufc + sizeof(struct ether_header) + iphdr->ip_len + sizeof(struct in_addr));
-            iphdr->ip_dst.s_addr    = peer_addr4->sin_addr.s_addr;
+            iphdr->ip_dst.s_addr    = peer_addr.sin_addr.s_addr;
             iphdr->ip_len           = iphdr->ip_len + sizeof(struct in_addr) + 2;
             iphdr->ip_sum           = iphdr_checksum((unsigned short*)(mbufc + sizeof(struct ether_header)), (sizeof(struct iphdr)/2));
         }
@@ -671,7 +618,6 @@ static void *home_from_vps_pkt_mangler_thread(void * arg)
         sem_wait(&if_config[EGRESS_IF].if_rxq.if_ready);
         if ((mbuf = circular_buffer_pop(if_config[EGRESS_IF].if_rxq.if_pkts)) == NULL) continue;
         mbufc                   = (unsigned char *) mbuf;
-        mbufc                   += sizeof(struct tap_hdr_s);
         if (mbuf->ipv6) {
             ip6hdr                  = (struct ip6_hdr *) (mbufc + sizeof(struct ether_header));
             sv_dest_addr6           = (struct in6_addr *) (mbufc + sizeof(struct ether_header) + sizeof(struct ip6_hdr) + ip6hdr->ip6_plen);
@@ -750,7 +696,6 @@ static void *vps_pkt_mangler_thread(void * arg)
         sem_wait(&if_config[EGRESS_IF].if_rxq.if_ready);
         if ((mbuf = circular_buffer_pop(if_config[EGRESS_IF].if_rxq.if_pkts)) == NULL) continue;
         mbufc                       = (unsigned char *) mbuf;
-        mbufc                       += sizeof(struct tap_hdr_s);
         if (mbuf->ipv6) {
             ip6hdr                  = (struct ip6_hdr *) (mbufc + sizeof(struct ether_header));
             sv_dest_addr6           = (struct in6_addr *) (mbufc + sizeof(struct ether_header) + sizeof(struct ip6_hdr) + ip6hdr->ip6_plen);
@@ -903,12 +848,13 @@ static int create_threads(int thread_cnt)
 // +----------------------------------------------------------------------------
 static int reconnect_comms_to_server(void)
 {
-    char            s[INET6_ADDRSTRLEN], rmt_port_str[7];
+    char            s[INET6_ADDRSTRLEN];
+    char            rmt_port_str[7];
     struct addrinfo hints, *result, *rp;
     int             rc;
 
     log_debug_msg(LOG_INFO, "%s-%d\n", __FUNCTION__, __LINE__);
-    close(comms_peer_fd);
+    if (comms_peer_fd > -1) close(comms_peer_fd);
 
     memset(&hints, 0, sizeof(struct addrinfo));
     hints.ai_family     = AF_UNSPEC;
@@ -940,6 +886,36 @@ static int reconnect_comms_to_server(void)
     freeaddrinfo(result);
     if (rp == NULL)
         return rc;
+//    if (ipv6_mode) {
+//        if ((comms_peer_fd = socket(AF_INET6, SOCK_STREAM, 0)) < 0) {
+//            log_msg(LOG_ERR, "%s-%d: Can not create comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+//            return errno;
+//        }
+//        peer_addr6.sin6_port       = htons((unsigned short)rmt_port);
+//        inet_ntop(AF_INET6, &peer_addr6.sin6_addr, s, sizeof s);
+//    } else {
+//        if ((comms_peer_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+//            log_msg(LOG_ERR, "%s-%d: Can not create comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+//            return errno;
+//        }
+//        peer_addr.sin_port        = htons((unsigned short)rmt_port);
+//        inet_ntop(AF_INET, &peer_addr.sin_addr, s, sizeof s);
+//    }
+//    log_msg(LOG_INFO, "Waiting for connection to %s on port %u...\n", s, rmt_port);
+//    if (ipv6_mode) {
+//        if (connect(comms_peer_fd, (struct sockaddr *) &peer_addr6, sizeof(peer_addr6)) < 0) {
+//            rc = errno;
+//            log_msg(LOG_ERR, "%s-%d: Not connected - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+//            return rc;
+//        }
+//    } else {
+//        if (connect(comms_peer_fd, (struct sockaddr *) &peer_addr, sizeof(peer_addr)) < 0) {
+//            rc = errno;
+//            log_msg(LOG_ERR, "%s-%d: Not connected - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+//            return rc;
+//        }
+//    }
+//    log_msg(LOG_INFO, "Connected.\n");
 
     peer_addr_valid = true;
     return 0;
@@ -997,7 +973,7 @@ static int handle_client_query(struct comms_query_s *query, int comms_client_fd,
                 log_msg(LOG_INFO, "IF ratio1: %u  IF ratio2: %u  Port: %u", if_config[0].if_ratio, if_config[1].if_ratio, cc_port);
                 if ((cliserv == SERVER) && (!peer_addr_valid)) {
                     if (ipv6_mode)
-                        memcpy(&peer_addr, &client_addr[0], sizeof(struct sockaddr_in6));
+                        memcpy(&peer_addr6, &client_addr[0], sizeof(struct sockaddr_in6));
                     else
                         memcpy(&peer_addr, &client_addr[0], sizeof(struct sockaddr_in));
                     reconnect_comms_to_server();
@@ -1235,16 +1211,21 @@ static void read_config_file(void)
         q_control_on = i;
         log_msg(LOG_INFO, "Configured for debugging queue control %s.\n", q_control_on ? "on" : "off");
     }
+    config_string = NULL;
+    if (config_lookup_string(&cfg, "comms_name", &config_string)) {
+        if ((comms_name = malloc(strlen(config_string)+1)) == NULL) {
+            log_msg(LOG_ERR, "%s-%d: Out of memory.\n", __FUNCTION__, __LINE__);
+            exit(ENOMEM);
+        }
+        strcpy(comms_name, config_string);
+        log_msg(LOG_INFO, "Configured for comms on %s.\n", comms_name);
+    }
     if (cliserv == CLIENT) {
-        if (config_lookup_string(&cfg, "client.ingress.tap", &config_string)) {
+        config_string = NULL;
+        if (config_lookup_string(&cfg, "client.ingress", &config_string)) {
             strcpy(if_config[INGRESS_IF].if_name, config_string);
-            log_msg(LOG_INFO, "Configured for client ingress tap on %s.\n", if_config[INGRESS_IF].if_name);
-            config_string = NULL;
-            if (config_lookup_string(&cfg, "client.ingress.bridge", &config_string)) {
-                ingresscnt = 1;
-                strcpy(if_config[INGRESS_IF].if_brname, config_string);
-                log_msg(LOG_INFO, "Configured for client ingress bridge on %s.\n", if_config[INGRESS_IF].if_brname);
-            }
+            log_msg(LOG_INFO, "Configured for client ingress on %s.\n", if_config[INGRESS_IF].if_name);
+            ingresscnt = 1;
         }
         config_string = NULL;
         if (config_lookup_string(&cfg, "client.server_name", &config_string)) {
@@ -1255,18 +1236,12 @@ static void read_config_file(void)
             strcpy(remote_name, config_string);
             log_msg(LOG_INFO, "Configured for server name %s.\n", remote_name);
         }
-        config_egress_list = config_lookup(&cfg, "client.egress.tap");
+        config_egress_list = config_lookup(&cfg, "client.egress.interface");
         for (i=EGRESS_IF, j=0; i<config_setting_length(config_egress_list); i++, j++) {
-            if (j == 2) break;  // no more than two tap interfaces
+            if (j == 2) break;  // no more than two egress interfaces
             egresscnt++;
             strcpy(if_config[i].if_name, config_setting_get_string_elem(config_egress_list, j));
-            log_msg(LOG_INFO, "Configured for client egress tap interface on %s.\n", if_config[i].if_name);
-        }
-        config_egress_list = config_lookup(&cfg, "client.egress.bridge");
-        for (i=EGRESS_IF, j=0; i<config_setting_length(config_egress_list); i++, j++) {
-            if (j == egresscnt) break; // no more than 2 bridge interfaces
-            strcpy(if_config[i].if_brname, config_setting_get_string_elem(config_egress_list, j));
-            log_msg(LOG_INFO, "Configured for client egress bridge interface on %s.\n", if_config[i].if_brname);
+            log_msg(LOG_INFO, "Configured for client egress interface on %s.\n", if_config[i].if_name);
         }
         config_egress_list = config_lookup(&cfg, "client.egress.ratio");
         for (i=EGRESS_IF, j=0; i<config_setting_length(config_egress_list); i++, j++) {
@@ -1275,15 +1250,10 @@ static void read_config_file(void)
             log_msg(LOG_INFO, "Configured for client egress interface ratio of %u on %s.\n", if_config[i].if_ratio, if_config[i].if_name);
         }
     } else {
-        if (config_lookup_string(&cfg, "server.tap", &config_string)) {
+        if (config_lookup_string(&cfg, "server.interface", &config_string)) {
             strcpy(if_config[EGRESS_IF].if_name, config_string);
             log_msg(LOG_INFO, "Configured for server interface on %s.\n", if_config[EGRESS_IF].if_name);
-            config_string = NULL;
-            if (config_lookup_string(&cfg, "server.bridge", &config_string)) {
-                egresscnt = 1;
-                strcpy(if_config[EGRESS_IF].if_brname, config_string);
-                log_msg(LOG_INFO, "Configured for server egress bridge on %s.\n", if_config[EGRESS_IF].if_brname);
-            }
+            egresscnt = 1;
         }
     }
 
@@ -1429,7 +1399,8 @@ int main(int argc, char *argv[])
     // allocate rx and tx circular buffers for egress interfaces. Note there are
     // two egress interfaces on the home gateway, and one on the vps
     for (i=0; i<egresscnt; i++) {
-        // Open raw socket for egress interface
+        // Open raw socket for egress tx interface, opened in IP mode so we don't have to 
+        // provide the ethernet header.
         if (ipv6_mode) {
             if ((if_config[i].if_tx_fd = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW)) < 0) {
                 rc = errno;
@@ -1445,12 +1416,19 @@ int main(int argc, char *argv[])
                 exit(rc);
             }
         }
+        // Set flag so socket expects us to provide IP header on egress tx socket.
+        if (setsockopt (if_config[i].if_tx_fd, IPPROTO_IP, IP_HDRINCL, &(int){ 1 }, sizeof(int)) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Can not set ip header socket option for egress interface - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        }
         memset(&ifr, 0, sizeof(ifr));
         if (ipv6_mode)
             ifr.ifr_addr.sa_family = AF_INET6;
         else
             ifr.ifr_addr.sa_family = AF_INET;
-        strncpy(ifr.ifr_name, if_config[i].if_brname, sizeof(ifr.ifr_name));
+        strncpy(ifr.ifr_name, if_config[i].if_name, sizeof(ifr.ifr_name));
         // Bind raw socket to a particular interface name (eg: ppp0 or ppp1)
         if (setsockopt(if_config[i].if_tx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
             rc = errno;
@@ -1458,10 +1436,29 @@ int main(int argc, char *argv[])
             exit_level1_cleanup();
             exit(rc);
         }
-        // Open egress rx tap interface
-        if ((if_config[i].if_rx_fd = tuntap_init(if_config[i].if_name)) < 0) {
+        // Open egress rx socket interface, this socket is opened such that we get the ethernet
+        // header as well as the ip header
+        if (ipv6_mode) {
+            if ((if_config[i].if_rx_fd = socket(AF_INET6, SOCK_RAW, ETH_P_ALL)) < 0) {
+                rc = errno;
+                log_msg(LOG_ERR, "%s-%d: Can not create socket for egress rx interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
+                exit_level1_cleanup();
+                exit(rc);
+            }
+        } else {
+            if ((if_config[i].if_rx_fd = socket(AF_INET, SOCK_RAW, ETH_P_ALL)) < 0) {
+                rc = errno;
+                log_msg(LOG_ERR, "%s-%d: Can not create socket for egress rx interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
+                exit_level1_cleanup();
+                exit(rc);
+            }
+        }
+        // Bind raw socket to a particular interface name (eg: ppp0 or ppp1)
+        if (setsockopt(if_config[i].if_rx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Can not bind socket to %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
             exit_level1_cleanup();
-            exit(-1*if_config[i].if_rx_fd);
+            exit(rc);
         }
         // Setup the rx queue
         if_config[i].if_rxq.if_index  = i;
@@ -1522,20 +1519,20 @@ int main(int argc, char *argv[])
             if (ipv6_mode) {
                 if (ifa_p->ifa_addr->sa_family == AF_INET6) {
                     for (i=0; i<egresscnt+ingresscnt; i++) {
-                        if (strcmp(if_config[i].if_brname, ifa_p->ifa_name) == 0) {
+                        if (strcmp(if_config[i].if_name, ifa_p->ifa_name) == 0) {
                             memcpy(&if_config[i].if_ipaddr, ifa_p->ifa_addr, sizeof(struct sockaddr_in6));
                             inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&if_config[i].if_ipaddr), ipaddr, sizeof(ipaddr));
-                            log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_config[i].if_brname, ipaddr);
+                            log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_config[i].if_name, ipaddr);
                         }
                     }
                 }
             } else {
                 if (ifa_p->ifa_addr->sa_family == AF_INET) {
                     for (i=0; i<egresscnt+ingresscnt; i++) {
-                        if (strcmp(if_config[i].if_brname, ifa_p->ifa_name) == 0) {
+                        if (strcmp(if_config[i].if_name, ifa_p->ifa_name) == 0) {
                             memcpy(&if_config[i].if_ipaddr, ifa_p->ifa_addr, sizeof(struct sockaddr_in));
                             inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&if_config[i].if_ipaddr), ipaddr, sizeof(ipaddr));
-                            log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_config[i].if_brname, ipaddr);
+                            log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_config[i].if_name, ipaddr);
                         }
                     }
                 }
@@ -1544,38 +1541,80 @@ int main(int argc, char *argv[])
         ifa_p = ifa_p->ifa_next;
     }
 
-    if (cliserv == CLIENT) {
-        // Open ingress rx tap interface
-        if ((if_config[INGRESS_IF].if_rx_fd = tuntap_init(if_config[INGRESS_IF].if_name)) < 0) {
+    // Convert comms name to comms ip address
+    if (ipv6_mode) {
+        if ((name_to_ip(comms_name, (struct sockaddr_storage *) &comms_addr6, AF_INET6)) != 0)
+        {
+            log_msg(LOG_ERR, "%s-%d: Could not translate hostname %s into ip address.\n", __FUNCTION__, __LINE__, remote_name);
             exit_level1_cleanup();
-            exit(-1*if_config[INGRESS_IF].if_rx_fd);
+            exit(EINVAL);
         }
-        // Open raw socket for ingress tx interface
+    } else {
+        if ((name_to_ip(comms_name, (struct sockaddr_storage *) &comms_addr, AF_INET)) != 0)
+        {
+            log_msg(LOG_ERR, "%s-%d: Could not translate hostname %s into ip address.\n", __FUNCTION__, __LINE__, remote_name);
+            exit_level1_cleanup();
+            exit(EINVAL);
+        }
+    }
+
+    if (cliserv == CLIENT) {
+        // Open raw socket for inress tx interface, opened in IP mode so we don't have to 
+        // provide the ethernet header.
         if (ipv6_mode) {
-            if ((if_config[INGRESS_IF].if_tx_fd = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW)) < 0)
-            {
+            if ((if_config[INGRESS_IF].if_tx_fd = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW)) < 0) {
                 rc = errno;
-                log_msg(LOG_ERR, "%s-%d: Can not create socket for ingress interface - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+                log_msg(LOG_ERR, "%s-%d: Can not create tx socket for ingress interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
                 exit_level1_cleanup();
                 exit(rc);
             }
         } else {
-            if ((if_config[INGRESS_IF].if_tx_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0)
-            {
+            if ((if_config[INGRESS_IF].if_tx_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0) {
                 rc = errno;
-                log_msg(LOG_ERR, "%s-%d: Can not create socket for ingress interface - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+                log_msg(LOG_ERR, "%s-%d: Can not create tx socket for ingress interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
                 exit_level1_cleanup();
                 exit(rc);
             }
+        }
+        // Set flag so socket expects us to provide IP header on egress tx socket.
+        if (setsockopt (if_config[i].if_tx_fd, IPPROTO_IP, IP_HDRINCL, &(int){ 1 }, sizeof(int)) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Can not set ip header socket option for ingress interface - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
         }
         memset(&ifr, 0, sizeof(ifr));
         if (ipv6_mode)
             ifr.ifr_addr.sa_family = AF_INET6;
         else
             ifr.ifr_addr.sa_family = AF_INET;
-        strncpy(ifr.ifr_name, if_config[INGRESS_IF].if_brname, sizeof(ifr.ifr_name));
-        // Bind raw socket to the ingress bridge
-        if (setsockopt(if_config[INGRESS_IF].if_tx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
+        strncpy(ifr.ifr_name, if_config[INGRESS_IF].if_name, sizeof(ifr.ifr_name));
+        // Bind raw socket to a particular interface name (eg: ppp0 or ppp1)
+        if (setsockopt(if_config[i].if_tx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Can not bind socket to %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        }
+        // Open ingress rx socket interface, this socket is opened such that we get the ethernet
+        // header as well as the ip header
+        if (ipv6_mode) {
+            if ((if_config[INGRESS_IF].if_rx_fd = socket(AF_INET6, SOCK_RAW, ETH_P_ALL)) < 0) {
+                rc = errno;
+                log_msg(LOG_ERR, "%s-%d: Can not create rx socket for ingress rx interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
+                exit_level1_cleanup();
+                exit(rc);
+            }
+        } else {
+            if ((if_config[INGRESS_IF].if_rx_fd = socket(AF_INET, SOCK_RAW, ETH_P_ALL)) < 0) {
+                rc = errno;
+                log_msg(LOG_ERR, "%s-%d: Can not create rx socket for ingress rx interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
+                exit_level1_cleanup();
+                exit(rc);
+            }
+        }
+        // Bind raw socket to a particular interface name (eg: ppp0 or ppp1)
+        if (setsockopt(if_config[i].if_rx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
             rc = errno;
             log_msg(LOG_ERR, "%s-%d: Can not bind socket to %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
             exit_level1_cleanup();
@@ -1636,7 +1675,7 @@ int main(int argc, char *argv[])
 
         // Convert server name to server ip address
         if (ipv6_mode) {
-            if ((name_to_ip(remote_name, (struct sockaddr_storage *) &peer_addr, AF_INET6)) != 0)
+            if ((name_to_ip(remote_name, (struct sockaddr_storage *) &peer_addr6, AF_INET6)) != 0)
             {
                 log_msg(LOG_ERR, "%s-%d: Could not translate hostname %s into ip address.\n", __FUNCTION__, __LINE__, remote_name);
                 exit_level1_cleanup();
