@@ -1,4 +1,7 @@
 *.o
-dslgateway
-dslgateway_ui
+dslserver
+dslui
+dslclient
+circular_buffer_ut
+mempool_ut
 nbproject/

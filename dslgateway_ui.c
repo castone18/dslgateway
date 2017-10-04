@@ -61,7 +61,6 @@ static struct sockaddr_in6  host_addr6;
 static struct sockaddr_in   host_addr;
 static int                  cc_port=-1;
 static unsigned int         print_stats_delay=5;
-static unsigned int         remote_thread_start=0;
 static bool                 ipv6_mode=false;
 static char                 config_file_name[PATH_MAX];
 
@@ -284,58 +283,6 @@ static void print_all_stats(unsigned int iter)
 
 // +----------------------------------------------------------------------------
 // +----------------------------------------------------------------------------
-static void print_all_threads(void)
-{
-    struct comms_query_s    clntqry, srvrqry;
-    struct comms_reply_s    clntrply, srvrrply;
-    int                     i, j;
-
-    clntqry.cmd         = COMMS_LISTTHREADS;
-    clntqry.for_peer  = false;
-    srvrqry.cmd         = COMMS_LISTTHREADS;
-    srvrqry.for_peer  = true;
-
-
-    send(comms_serv_fd, &clntqry, sizeof(struct comms_query_s), 0);
-    recv(comms_serv_fd, &clntrply, sizeof(struct comms_reply_s), 0);
-    printf("\nLocal Threads:\n");
-    for (i=0, j=0; i<clntrply.num_threads; i++, j++) {
-        printf("Thread %d: %s %s\n", j, clntrply.thread_names[j],
-                clntrply.thread_status[j] ? "Running" : "Stopped");
-    }
-    remote_thread_start = j;
-    send(comms_serv_fd, &srvrqry, sizeof(struct comms_query_s), 0);
-    recv(comms_serv_fd, &srvrrply, sizeof(struct comms_reply_s), 0);
-    if (srvrrply.rc == 0) {
-        printf("\nRemote Threads:\n");
-        for (i=0; i<srvrrply.num_threads; i++, j++) {
-            printf("Thread %d: %s %s\n", j, srvrrply.thread_names[j],
-                    srvrrply.thread_status[j] ? "Running" : "Stopped");
-        }
-    } else {
-        printf("No connection to remote, assume remote threads not running.\n");
-    }
-}
-
-
-// +----------------------------------------------------------------------------
-// +----------------------------------------------------------------------------
-static void start_stop_thread(bool start_stop, unsigned int thread_num)
-{
-    struct comms_query_s qry;
-    struct comms_reply_s rply;
-
-    if (start_stop) qry.cmd = COMMS_STARTTHREAD;
-    if (thread_num >= remote_thread_start) qry.for_peer=true;
-    send(comms_serv_fd, &qry, sizeof(struct comms_query_s), 0);
-    recv(comms_serv_fd, &rply, sizeof(struct comms_reply_s), 0);
-    if (start_stop) printf("\nThread %d started.\n", thread_num);
-    else printf("\nThread %d stopped.\n", thread_num);
-}
-
-
-// +----------------------------------------------------------------------------
-// +----------------------------------------------------------------------------
 static void kill_daemons(void)
 {
     struct comms_query_s qry;
@@ -369,7 +316,7 @@ static void send_qcontrol(char *command)
 int main(int argc, char *argv[])
 {
     int                     opt, rdsz;
-    unsigned int            iter=0, thread_num;
+    unsigned int            iter=0;
     char                    hostname[256], command[4096];
     bool                    keep_going=true;
     struct comms_query_s    qry;
@@ -445,26 +392,6 @@ int main(int argc, char *argv[])
         if (strncmp(command, "stats", 5) == 0) {
             print_all_stats(0);
         }
-        if (strncmp(command, "threads", 7) == 0) {
-            print_all_threads();
-            continue;
-        }
-        if (strncmp(command, "stop", 4) == 0) {
-            if (remote_thread_start == 0) {
-                printf("Please run threads command first.\n");
-            }
-            sscanf(&command[5], "%u", &thread_num);
-            start_stop_thread(false, thread_num);
-            continue;
-        }
-        if (strncmp(command, "start", 5) == 0) {
-            if (remote_thread_start == 0) {
-                printf("Please run threads command first.\n");
-            }
-            sscanf(&command[6], "%u", &thread_num);
-            start_stop_thread(true, thread_num);
-            continue;
-        }
         if (strncmp(command, "exit", 4) == 0) {
             qry.cmd         = COMMS_EXIT;
             qry.for_peer  = false;
@@ -480,7 +407,6 @@ int main(int argc, char *argv[])
             send_qcontrol(command);
             continue;
         }
-        printf("Commands: stats, threads, stop <threadno>, start <threadno>, exit, kill\n");
-        printf("          qcontrol <index> <value>\n");
+        printf("Commands: stats, exit, kill, qcontrol <index> <value>\n");
     }
 }

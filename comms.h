@@ -36,10 +36,7 @@ extern "C" {
 // Comms commands
 #define COMMS_HELO              0
 #define COMMS_GETSTATS          1
-#define COMMS_STOPTHREAD        2
-#define COMMS_STARTTHREAD       3
 #define COMMS_SET_QCONTROL      4
-#define COMMS_LISTTHREADS       5
 #define COMMS_KILL              6
 #define COMMS_EXIT              7
 
@@ -69,8 +66,8 @@ struct statistics_s {
 
 struct comms_helo_data_s {
     struct sockaddr_storage egress_addr[NUM_EGRESS_INTERFACES];
-    unsigned long           if_ratio[NUM_EGRESS_INTERFACES];
-    unsigned int            cc_port;
+    uint32_t                if_ratio[NUM_EGRESS_INTERFACES];
+    uint32_t                cc_port;
     bool                    ipv6_mode;
 };
 
