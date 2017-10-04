@@ -621,6 +621,9 @@ int main(int argc, char *argv[])
 
     if_stats.num_interfaces = 1;
     if_stats.ipv6_mode      = ipv6_mode;
+    for (i=0; i<if_stats.num_interfaces; i++) {
+        strncpy(if_stats.if_name[i], if_config[i].if_name, IFNAMSIZ);
+    }
 
     // Start up the server threads
     create_threads();

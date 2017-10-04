@@ -181,6 +181,8 @@ static void print_stats(struct comms_reply_s *rply, char *name)
                 rply->stats.if_rx_bytes[1], rply->stats.if_rx_bytes[2]);
         printf("Tx Bytes:        %19llu  %19llu  %19llu\n", rply->stats.if_tx_bytes[0],
                 rply->stats.if_tx_bytes[1], rply->stats.if_tx_bytes[2]);
+        printf("Dropped:         %19llu  %19llu  %19llu\n", rply->stats.if_dropped_pkts[0],
+                rply->stats.if_dropped_pkts[1], rply->stats.if_dropped_pkts[2]);
         printf("CBUF rxq sz:               %9u            %9u            %9u\n", rply->stats.circular_buffer_rxq_sz[0],
                 rply->stats.circular_buffer_rxq_sz[1], rply->stats.circular_buffer_rxq_sz[2]);
         printf("CBUF txq sz:               %9u            %9u            %9u\n", rply->stats.circular_buffer_txq_sz[0],
@@ -203,6 +205,7 @@ static void print_stats(struct comms_reply_s *rply, char *name)
         printf("Tx Packets:  %19llu\n", rply->stats.if_tx_pkts[0]);
         printf("Rx Bytes:    %19llu\n", rply->stats.if_rx_bytes[0]);
         printf("Tx Bytes:    %19llu\n", rply->stats.if_tx_bytes[0]);
+        printf("Dropped:     %19llu\n", rply->stats.if_dropped_pkts[0]);
         printf("CBUF rxq sz:           %9u\n", rply->stats.circular_buffer_rxq_sz[0]);
         printf("CBUF txq sz:           %9u\n", rply->stats.circular_buffer_txq_sz[0]);
         printf("CBUF rxq freesz:       %9u\n", rply->stats.circular_buffer_rxq_freesz[0]);

@@ -523,11 +523,11 @@ int handle_client_query(struct comms_query_s *query, int comms_client_fd, bool *
         if (comms_addr_valid) {
             query->for_peer = false;
             while(((rc=send(comms_peer_fd, query, sizeof(struct comms_query_s), 0)) == -1) && (errno == EINTR));
-                if (rc == -1) {
+            if (rc == -1) {
                 log_msg(LOG_WARNING, "%s-%d: Could net send message to peer - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
             } else {
                 while(((rc = recv(comms_peer_fd, &reply, sizeof(struct comms_reply_s), 0)) == -1) && (errno == EINTR));
-                }
+            }
             if (rc == -1) reply.rc = errno;
             else reply.rc = 0;
         } else {
@@ -569,9 +569,9 @@ int handle_client_query(struct comms_query_s *query, int comms_client_fd, bool *
             default:
                 reply.rc    = -1;
         }
+        reply.is_client = true;
     }
 
-    reply.is_client = true;
     send(comms_client_fd, &reply, sizeof(struct comms_reply_s), 0);
 }
 
@@ -952,6 +952,9 @@ int main(int argc, char *argv[])
     }
     if_stats.num_interfaces = 3;
     if_stats.ipv6_mode      = ipv6_mode;
+    for (i=0; i<if_stats.num_interfaces; i++) {
+        strncpy(if_stats.if_name[i], if_config[i].if_name, IFNAMSIZ);
+    }
 
     // Start up the client threads
     create_threads();
