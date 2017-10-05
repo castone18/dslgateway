@@ -52,9 +52,11 @@
 #include <netinet/in.h>
 #include <libconfig.h>
 #include <limits.h>
+#include <termios.h>
 
 #include "comms.h"
 #include "util.h"
+#include "dslgateway.h"
 
 static int                  comms_serv_fd;
 static struct sockaddr_in6  host_addr6;
@@ -171,47 +173,47 @@ static void print_stats(struct comms_reply_s *rply, char *name)
 
     printf("\n%s interface statistics:\n", name);
     if (rply->stats.num_interfaces == 3) {
-        printf("                 %19s  %19s  %19s\n", rply->stats.if_name[0],
-                rply->stats.if_name[1], rply->stats.if_name[2]);
-        printf("Rx Packets:      %19llu  %19llu  %19llu\n", rply->stats.if_rx_pkts[0],
-                rply->stats.if_rx_pkts[1], rply->stats.if_rx_pkts[2]);
-        printf("Tx Packets:      %19llu  %19llu  %19llu\n", rply->stats.if_tx_pkts[0],
-                rply->stats.if_tx_pkts[1], rply->stats.if_tx_pkts[2]);
-        printf("Rx Bytes:        %19llu  %19llu  %19llu\n", rply->stats.if_rx_bytes[0],
-                rply->stats.if_rx_bytes[1], rply->stats.if_rx_bytes[2]);
-        printf("Tx Bytes:        %19llu  %19llu  %19llu\n", rply->stats.if_tx_bytes[0],
-                rply->stats.if_tx_bytes[1], rply->stats.if_tx_bytes[2]);
-        printf("Dropped:         %19llu  %19llu  %19llu\n", rply->stats.if_dropped_pkts[0],
-                rply->stats.if_dropped_pkts[1], rply->stats.if_dropped_pkts[2]);
-        printf("CBUF rxq sz:               %9u            %9u            %9u\n", rply->stats.circular_buffer_rxq_sz[0],
-                rply->stats.circular_buffer_rxq_sz[1], rply->stats.circular_buffer_rxq_sz[2]);
-        printf("CBUF txq sz:               %9u            %9u            %9u\n", rply->stats.circular_buffer_txq_sz[0],
-                rply->stats.circular_buffer_txq_sz[1], rply->stats.circular_buffer_txq_sz[2]);
-        printf("CBUF rxq freesz:           %9u            %9u            %9u\n", rply->stats.circular_buffer_rxq_freesz[0],
-                rply->stats.circular_buffer_rxq_freesz[1], rply->stats.circular_buffer_rxq_freesz[2]);
-        printf("CBUF txq freesz:           %9u            %9u            %9u\n", rply->stats.circular_buffer_txq_freesz[0],
-                rply->stats.circular_buffer_txq_freesz[1], rply->stats.circular_buffer_txq_freesz[2]);
-        printf("CBUF rxq ovhdsz:           %9u            %9u            %9u\n", rply->stats.circular_buffer_rxq_overheadsz[0],
-                rply->stats.circular_buffer_rxq_overheadsz[1], rply->stats.circular_buffer_rxq_overheadsz[2]);
-        printf("CBUF txq ovhdsz:           %9u            %9u            %9u\n\n", rply->stats.circular_buffer_txq_overheadsz[0],
-                rply->stats.circular_buffer_txq_overheadsz[1], rply->stats.circular_buffer_txq_overheadsz[2]);
+        printf("                 %19s  %19s  %19s\n", rply->stats.if_name[EGRESS_IF],
+                rply->stats.if_name[EGRESS_IF+1], rply->stats.if_name[INGRESS_IF]);
+        printf("Rx Packets:      %19llu  %19llu  %19llu\n", rply->stats.if_rx_pkts[EGRESS_IF],
+                rply->stats.if_rx_pkts[EGRESS_IF+1], rply->stats.if_rx_pkts[INGRESS_IF]);
+        printf("Tx Packets:      %19llu  %19llu  %19llu\n", rply->stats.if_tx_pkts[EGRESS_IF],
+                rply->stats.if_tx_pkts[EGRESS_IF+1], rply->stats.if_tx_pkts[INGRESS_IF]);
+        printf("Rx Bytes:        %19llu  %19llu  %19llu\n", rply->stats.if_rx_bytes[EGRESS_IF],
+                rply->stats.if_rx_bytes[EGRESS_IF+1], rply->stats.if_rx_bytes[INGRESS_IF]);
+        printf("Tx Bytes:        %19llu  %19llu  %19llu\n", rply->stats.if_tx_bytes[EGRESS_IF],
+                rply->stats.if_tx_bytes[EGRESS_IF+1], rply->stats.if_tx_bytes[INGRESS_IF]);
+        printf("Dropped:         %19llu  %19llu  %19llu\n", rply->stats.if_dropped_pkts[EGRESS_IF],
+                rply->stats.if_dropped_pkts[EGRESS_IF+1], rply->stats.if_dropped_pkts[INGRESS_IF]);
+        printf("CBUF rxq sz:               %9u            %9u            %9u\n", rply->stats.circular_buffer_rxq_sz[EGRESS_IF],
+                rply->stats.circular_buffer_rxq_sz[EGRESS_IF+1], rply->stats.circular_buffer_rxq_sz[INGRESS_IF]);
+        printf("CBUF txq sz:               %9u            %9u            %9u\n", rply->stats.circular_buffer_txq_sz[EGRESS_IF],
+                rply->stats.circular_buffer_txq_sz[EGRESS_IF+1], rply->stats.circular_buffer_txq_sz[INGRESS_IF]);
+        printf("CBUF rxq freesz:           %9u            %9u            %9u\n", rply->stats.circular_buffer_rxq_freesz[EGRESS_IF],
+                rply->stats.circular_buffer_rxq_freesz[EGRESS_IF+1], rply->stats.circular_buffer_rxq_freesz[INGRESS_IF]);
+        printf("CBUF txq freesz:           %9u            %9u            %9u\n", rply->stats.circular_buffer_txq_freesz[EGRESS_IF],
+                rply->stats.circular_buffer_txq_freesz[EGRESS_IF+1], rply->stats.circular_buffer_txq_freesz[INGRESS_IF]);
+        printf("CBUF rxq ovhdsz:           %9u            %9u            %9u\n", rply->stats.circular_buffer_rxq_overheadsz[EGRESS_IF],
+                rply->stats.circular_buffer_rxq_overheadsz[EGRESS_IF+1], rply->stats.circular_buffer_rxq_overheadsz[INGRESS_IF]);
+        printf("CBUF txq ovhdsz:           %9u            %9u            %9u\n\n", rply->stats.circular_buffer_txq_overheadsz[EGRESS_IF],
+                rply->stats.circular_buffer_txq_overheadsz[EGRESS_IF+1], rply->stats.circular_buffer_txq_overheadsz[INGRESS_IF]);
         printf("Reorders: %19llu  Reorder Failures: %19llu\n", rply->stats.reorders,
                 rply->stats.reorder_failures);
         printf("Mempool total sz: %9u  free sz: %9u  overhead sz: %9u\n", rply->stats.mempool_totalsz,
                 rply->stats.mempool_freesz, rply->stats.mempool_overheadsz);
     } else {
-        printf("             %19s\n", rply->stats.if_name[0]);
-        printf("Rx Packets:  %19llu\n", rply->stats.if_rx_pkts[0]);
-        printf("Tx Packets:  %19llu\n", rply->stats.if_tx_pkts[0]);
-        printf("Rx Bytes:    %19llu\n", rply->stats.if_rx_bytes[0]);
-        printf("Tx Bytes:    %19llu\n", rply->stats.if_tx_bytes[0]);
-        printf("Dropped:     %19llu\n", rply->stats.if_dropped_pkts[0]);
-        printf("CBUF rxq sz:           %9u\n", rply->stats.circular_buffer_rxq_sz[0]);
-        printf("CBUF txq sz:           %9u\n", rply->stats.circular_buffer_txq_sz[0]);
-        printf("CBUF rxq freesz:       %9u\n", rply->stats.circular_buffer_rxq_freesz[0]);
-        printf("CBUF txq freesz:       %9u\n", rply->stats.circular_buffer_txq_freesz[0]);
-        printf("CBUF rxq ovhdsz:       %9u\n", rply->stats.circular_buffer_rxq_overheadsz[0]);
-        printf("CBUF txq ovhdsz:       %9u\n\n", rply->stats.circular_buffer_txq_overheadsz[0]);
+        printf("             %19s\n", rply->stats.if_name[EGRESS_IF]);
+        printf("Rx Packets:  %19llu\n", rply->stats.if_rx_pkts[EGRESS_IF]);
+        printf("Tx Packets:  %19llu\n", rply->stats.if_tx_pkts[EGRESS_IF]);
+        printf("Rx Bytes:    %19llu\n", rply->stats.if_rx_bytes[EGRESS_IF]);
+        printf("Tx Bytes:    %19llu\n", rply->stats.if_tx_bytes[EGRESS_IF]);
+        printf("Dropped:     %19llu\n", rply->stats.if_dropped_pkts[EGRESS_IF]);
+        printf("CBUF rxq sz:           %9u\n", rply->stats.circular_buffer_rxq_sz[EGRESS_IF]);
+        printf("CBUF txq sz:           %9u\n", rply->stats.circular_buffer_txq_sz[EGRESS_IF]);
+        printf("CBUF rxq freesz:       %9u\n", rply->stats.circular_buffer_rxq_freesz[EGRESS_IF]);
+        printf("CBUF txq freesz:       %9u\n", rply->stats.circular_buffer_txq_freesz[EGRESS_IF]);
+        printf("CBUF rxq ovhdsz:       %9u\n", rply->stats.circular_buffer_rxq_overheadsz[EGRESS_IF]);
+        printf("CBUF txq ovhdsz:       %9u\n\n", rply->stats.circular_buffer_txq_overheadsz[EGRESS_IF]);
         printf("Reorders: %19llu  Reorder Failures: %19llu\n", rply->stats.reorders,
                 rply->stats.reorder_failures);
         printf("Mempool total sz: %9u  free sz: %9u  overhead sz: %9u\n", rply->stats.mempool_totalsz,
@@ -220,13 +222,13 @@ static void print_stats(struct comms_reply_s *rply, char *name)
             if (ipv6_mode) {
                 addr6 = (struct sockaddr_in6 *) &rply->stats.client_sa[0];
                 inet_ntop(AF_INET6, &addr6->sin6_addr, client_ip_str[0], INET6_ADDRSTRLEN);
-                addr6 = (struct sockaddr_in6 *) &rply->stats.client_sa[1];
-                inet_ntop(AF_INET6, &addr6->sin6_addr, client_ip_str[1], INET6_ADDRSTRLEN);
+                addr6 = (struct sockaddr_in6 *) &rply->stats.client_sa[EGRESS_IF+1];
+                inet_ntop(AF_INET6, &addr6->sin6_addr, client_ip_str[EGRESS_IF+1], INET6_ADDRSTRLEN);
             } else {
                 addr4 = (struct sockaddr_in *) &rply->stats.client_sa[0];
                 inet_ntop(AF_INET, &addr4->sin_addr, client_ip_str[0], INET_ADDRSTRLEN);
-                addr4 = (struct sockaddr_in *) &rply->stats.client_sa[1];
-                inet_ntop(AF_INET, &addr4->sin_addr, client_ip_str[1], INET_ADDRSTRLEN);
+                addr4 = (struct sockaddr_in *) &rply->stats.client_sa[EGRESS_IF+1];
+                inet_ntop(AF_INET, &addr4->sin_addr, client_ip_str[EGRESS_IF+1], INET_ADDRSTRLEN);
             }
             printf("Client is connected on %s and %s.\n", client_ip_str[0], client_ip_str[1]);
         } else {
@@ -246,25 +248,58 @@ static void print_all_stats(unsigned int iter)
     bool                    keep_going=true;
     fd_set                  set;
     struct timeval          timeout;
-    int                     rc;
+    int                     rc, bytecnt;
     struct comms_query_s    clntqry, srvrqry;
     struct comms_reply_s    clntrply, srvrrply;
-    char                    c;
+    char                    c, *clntqry_c=(char *) &clntqry, *srvrqry_c=(char*) &srvrqry;
+    char                    *clntrply_c=(char *) &clntrply, *srvrrply_c=(char*) &srvrrply;
+    struct termios          ctrl;
 
     clntqry.cmd         = COMMS_GETSTATS;
     clntqry.for_peer    = false;
     srvrqry.cmd         = COMMS_GETSTATS;
     srvrqry.for_peer    = true;
 
+    tcgetattr(STDIN_FILENO, &ctrl);
+    ctrl.c_lflag &= ~ICANON; // turning off canonical mode makes input unbuffered
+    tcsetattr(STDIN_FILENO, TCSANOW, &ctrl);
 
     do {
-        send(comms_serv_fd, &clntqry, sizeof(struct comms_query_s), 0);
-        recv(comms_serv_fd, &clntrply, sizeof(struct comms_reply_s), 0);
+        bytecnt = 0;
+        do {
+            if ((rc = send(comms_serv_fd, &clntqry_c[bytecnt], sizeof(struct comms_query_s)-bytecnt, 0)) == -1) {
+                printf("Error sending request to local instance - %s", strerror(errno));
+                continue;
+            }
+            bytecnt += rc;
+        } while (bytecnt < sizeof(struct comms_query_s));
+        bytecnt = 0;
+        do {
+            if ((rc = recv(comms_serv_fd, &clntrply_c[bytecnt], sizeof(struct comms_reply_s)-bytecnt, 0)) == -1) {
+                printf("Error receiving reply from local instance - %s", strerror(errno));
+                continue;
+            }
+            bytecnt += rc;
+        } while (bytecnt < sizeof(struct comms_reply_s));
         printf("%s%s", clr, topLeft); // Clear screen and move to top left
         if (clntrply.rc == 0) print_stats(&clntrply, "Local");
         else printf("Error retrieving stats, rc=%d.\n", clntrply.rc);
-        send(comms_serv_fd, &srvrqry, sizeof(struct comms_query_s), 0);
-        recv(comms_serv_fd, &srvrrply, sizeof(struct comms_reply_s), 0);
+        bytecnt = 0;
+        do {
+            if ((rc = send(comms_serv_fd, &srvrqry_c[bytecnt], sizeof(struct comms_query_s)-bytecnt, 0)) == -1) {
+                printf("Error sending request to remote instance - %s", strerror(errno));
+                continue;
+            }
+            bytecnt += rc;
+        } while (bytecnt < sizeof(struct comms_query_s));
+        bytecnt = 0;
+        do {
+            if ((rc = recv(comms_serv_fd, &srvrrply_c[bytecnt], sizeof(struct comms_reply_s)-bytecnt, 0)) == -1) {
+                printf("Error receiving reply from remote instance - %s", strerror(errno));
+                continue;
+            }
+            bytecnt += rc;
+        } while (bytecnt < sizeof(struct comms_reply_s));
         if (srvrrply.rc == 0) print_stats(&srvrrply, "Remote");
         else printf("Error retrieving remote stats, rc=%d.\n", srvrrply.rc);
         timeout.tv_sec      = print_stats_delay;
@@ -281,6 +316,10 @@ static void print_all_stats(unsigned int iter)
         if (iter != 0)
             if (iter-- == 0) keep_going=false;
     } while (keep_going);
+
+    tcgetattr(STDIN_FILENO, &ctrl);
+    ctrl.c_lflag |= ICANON; // turning on canonical mode makes input buffered
+    tcsetattr(STDIN_FILENO, TCSANOW, &ctrl);
 }
 
 

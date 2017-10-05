@@ -40,6 +40,7 @@ extern "C" {
 #define COMMS_KILL              6
 #define COMMS_EXIT              7
 
+#pragma pack(1)    
 struct statistics_s {
     char                    if_name[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES][IFNAMSIZ+1];
     unsigned long long      if_rx_pkts[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
@@ -88,6 +89,7 @@ struct comms_reply_s {
     unsigned int        num_threads;
     bool                is_client;
 };
+#pragma pack()
 
 
 

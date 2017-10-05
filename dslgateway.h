@@ -26,6 +26,9 @@
 #ifndef DSLGATEWAY_H
 #define DSLGATEWAY_H
 
+#include "mempool.h"
+#include "circular_buffer.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -115,7 +118,7 @@ void open_egress_interfaces(void);
 void get_ip_addrs(void);
 void process_comms(void);
 void usage(char *progname);
-int handle_client_query(struct comms_query_s *query, int comms_client_fd, bool *connection_active);
+void handle_client_query(struct comms_query_s *query, int comms_client_fd, bool *connection_active);
 unsigned short iphdr_checksum(unsigned short* buff, int _16bitword);
 void process_remote_comms(void);
 

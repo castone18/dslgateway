@@ -514,24 +514,39 @@ static int create_threads(void)
 // +----------------------------------------------------------------------------
 // | Handle a query on the comms socket
 // +----------------------------------------------------------------------------
-int handle_client_query(struct comms_query_s *query, int comms_client_fd, bool *connection_active)
+void handle_client_query(struct comms_query_s *query, int comms_client_fd, bool *connection_active)
 {
-    int                     rc, i;
+    int                     rc, i, bytecnt;
     struct comms_reply_s    reply;
+    char                    *query_c = (char *) query;
+    char                    *reply_c = (char *) &reply;
 
     if (query->for_peer) {
         if (comms_addr_valid) {
             query->for_peer = false;
-            while(((rc=send(comms_peer_fd, query, sizeof(struct comms_query_s), 0)) == -1) && (errno == EINTR));
-            if (rc == -1) {
-                log_msg(LOG_WARNING, "%s-%d: Could net send message to peer - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-            } else {
-                while(((rc = recv(comms_peer_fd, &reply, sizeof(struct comms_reply_s), 0)) == -1) && (errno == EINTR));
-            }
-            if (rc == -1) reply.rc = errno;
-            else reply.rc = 0;
+            bytecnt = 0;
+            do {
+                if ((rc = send(comms_peer_fd, &query_c[bytecnt], sizeof(struct comms_query_s)-bytecnt, 0)) == -1) {
+                    log_msg(LOG_ERR, "%s-%d: Error sending comms request to remote peer - %s", __FUNCTION__, __LINE__, strerror(errno));
+                    reply.rc = errno;
+                    send(comms_client_fd, &reply, sizeof(struct comms_reply_s), 0);
+                    return;
+                }
+                bytecnt += rc;
+            } while (bytecnt < sizeof(struct comms_query_s));
+            bytecnt = 0;
+            do {
+                if ((rc = recv(comms_peer_fd, &reply_c[bytecnt], sizeof(struct comms_reply_s)-bytecnt, 0)) == -1) {
+                    log_msg(LOG_ERR, "%s-%d: Error receiving reply from remote peer - %s", __FUNCTION__, __LINE__, strerror(errno));
+                    reply.rc = errno;
+                    send(comms_client_fd, &reply, sizeof(struct comms_reply_s), 0);
+                    return;
+                }
+                bytecnt += rc;
+            } while (bytecnt < sizeof(struct comms_reply_s));
+            reply.rc = 0;
         } else {
-            reply.rc    = 1;
+            reply.rc = 1;
         }
     } else {
         switch (query->cmd){
@@ -572,7 +587,16 @@ int handle_client_query(struct comms_query_s *query, int comms_client_fd, bool *
         reply.is_client = true;
     }
 
-    send(comms_client_fd, &reply, sizeof(struct comms_reply_s), 0);
+    bytecnt = 0;
+    do {
+        if ((rc = send(comms_client_fd, &reply_c[bytecnt], sizeof(struct comms_reply_s)-bytecnt, 0)) == -1) {
+            log_msg(LOG_ERR, "%s-%d: Error sending comms request to remote peer - %s", __FUNCTION__, __LINE__, strerror(errno));
+            reply.rc = errno;
+            send(comms_client_fd, &reply, sizeof(struct comms_reply_s), 0);
+            return;
+        }
+        bytecnt += rc;
+    } while (bytecnt < sizeof(struct comms_reply_s));
 }
 
 
@@ -815,7 +839,7 @@ int main(int argc, char *argv[])
         ifr.ifr_addr.sa_family = AF_INET;
     strncpy(ifr.ifr_name, if_config[INGRESS_IF].if_name, sizeof(ifr.ifr_name));
     // Bind raw socket to a particular interface name (eg: ppp0 or ppp1)
-    if (setsockopt(if_config[i].if_tx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
+    if (setsockopt(if_config[INGRESS_IF].if_tx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
         rc = errno;
         log_msg(LOG_ERR, "%s-%d: Can not bind socket to %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
         exit_level1_cleanup();

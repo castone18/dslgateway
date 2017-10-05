@@ -85,7 +85,6 @@ bool                        q_control_on=false;
 bool                        comms_addr_valid=false;
 char                        *comms_name=NULL;
 
-static int                          commsfd, rmt_commsfd;
 static struct sockaddr_in6          comms_addr6;
 static struct sockaddr_in           comms_addr;
 
@@ -248,6 +247,7 @@ static void *comms_thread(void *arg)
         }
     }
     close(thread_parms->peer_fd);
+    free(thread_parms);
     pthread_exit(NULL);
 }
 
@@ -531,6 +531,7 @@ void process_remote_comms(void)
 {
     struct comms_thread_parms_s *comms_thread_parms;
     int                         rc;
+    int                         rmt_commsfd;
     
     // Open remote communication channel
     create_comms_channel(rmt_port, &rmt_commsfd);
@@ -558,6 +559,7 @@ void process_comms(void)
     struct sockaddr_in          comms_client_addr;
     char                        ipaddr[INET6_ADDRSTRLEN];
     struct comms_thread_parms_s *comms_thread_parms;
+    int                         commsfd;
     
     // Open local communication channel
     create_comms_channel(cc_port, &commsfd);
