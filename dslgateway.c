@@ -112,7 +112,7 @@ extern mempool                  mPool;
 extern bool                     wipebufs;
 extern int                      comms_peer_fd;
 extern struct statistics_s      if_stats;
-extern unsigned int             cc_port, rmt_port;
+extern unsigned int             cc_port;
 extern struct thread_list_s     dsl_threads[((NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES)*2)+2];
 extern int                      thread_exit_rc;
 extern bool                     comms_addr_valid;
@@ -437,6 +437,9 @@ void handle_client_query(struct comms_query_s *query, int comms_client_fd, bool 
                 reply.rc    = 0;
                 break;
             case COMMS_KILL:
+                reply.rc        = 0;
+                reply.is_client = false;
+                send(comms_client_fd, &reply, sizeof(struct comms_reply_s), 0);
                 exit_level1_cleanup();
                 exit(EXIT_SUCCESS);
                 break;
@@ -489,8 +492,6 @@ static void read_config_file(void)
 
     if (config_lookup_int(&cfg, "port", &cc_port))
         log_msg(LOG_INFO, "Configured for comms port on %d.\n", cc_port);
-    if (config_lookup_int(&cfg, "remote_port", &rmt_port))
-        log_msg(LOG_INFO, "Configured for remote comms port on %d.\n", rmt_port);
     if (config_lookup_int(&cfg, "mbufs", &n_mbufs))
         log_msg(LOG_INFO, "Configured for %d mbufs.\n", n_mbufs);
     if (config_lookup_int(&cfg, "ipversion", &i)) {
@@ -530,6 +531,7 @@ int main(int argc, char *argv[])
     pid_t                       pid, sid;
     struct sigaction            sigact;
     struct sched_param          sparam;
+    sem_t                       goodnight;
 
     i=0;
     if (argv[0][0] == '.' || argv[0][0] == '/') i++;
@@ -651,10 +653,14 @@ int main(int argc, char *argv[])
     // Start up the server threads
     create_threads();
 
-    // Process comms until killed
-    process_remote_comms();
+    // Start comms thread
     process_comms();
 
-    exit_level1_cleanup();
-    exit(EXIT_SUCCESS);
+    log_msg(LOG_INFO, "%s daemon started.\n", progname);
+
+    // Go to sleep on a locked semaphore
+    sem_init(&goodnight, 0, 0);
+    sem_wait(&goodnight);
+
+    exit(EFAULT);
 }

@@ -74,7 +74,7 @@ extern char                     *progname;
 extern struct if_config_s       if_config[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
 extern unsigned int             egresscnt, ingresscnt;
 extern struct statistics_s      if_stats;
-extern unsigned int             cc_port, rmt_port;
+extern unsigned int             cc_port;
 extern  struct thread_list_s    dsl_threads[((NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES)*2)+2];
 extern mempool                  mPool;
 extern int                      comms_peer_fd;
@@ -521,10 +521,13 @@ void handle_client_query(struct comms_query_s *query, int comms_client_fd, bool 
     char                    *query_c = (char *) query;
     char                    *reply_c = (char *) &reply;
 
+    log_debug_msg(LOG_INFO, "Received request %02x.\n", query->cmd);
     if (query->for_peer) {
+        log_debug_msg(LOG_INFO, "Request is for peer.\n");
         if (comms_addr_valid) {
             query->for_peer = false;
             bytecnt = 0;
+            log_debug_msg(LOG_INFO, "Sending request to peer.\n");
             do {
                 if ((rc = send(comms_peer_fd, &query_c[bytecnt], sizeof(struct comms_query_s)-bytecnt, 0)) == -1) {
                     log_msg(LOG_ERR, "%s-%d: Error sending comms request to remote peer - %s", __FUNCTION__, __LINE__, strerror(errno));
@@ -544,6 +547,7 @@ void handle_client_query(struct comms_query_s *query, int comms_client_fd, bool 
                 }
                 bytecnt += rc;
             } while (bytecnt < sizeof(struct comms_reply_s));
+            log_debug_msg(LOG_INFO, "Received reply from peer, rc=%d.\n", reply.rc);
             reply.rc = 0;
         } else {
             reply.rc = 1;
@@ -566,6 +570,9 @@ void handle_client_query(struct comms_query_s *query, int comms_client_fd, bool 
                 reply.rc    = 0;
                 break;
             case COMMS_KILL:
+                reply.rc        = 0;
+                reply.is_client = true;
+                send(comms_client_fd, &reply, sizeof(struct comms_reply_s), 0);
                 exit_level1_cleanup();
                 exit(EXIT_SUCCESS);
                 break;
@@ -582,6 +589,7 @@ void handle_client_query(struct comms_query_s *query, int comms_client_fd, bool 
                 reply.rc            = 0;
                 break;
             default:
+                log_debug_msg(LOG_INFO, "Received invalid request.\n");
                 reply.rc    = -1;
         }
         reply.is_client = true;
@@ -619,8 +627,6 @@ static void read_config_file(void)
 
     if (config_lookup_int(&cfg, "port", &cc_port))
         log_msg(LOG_INFO, "Configured for comms port on %d.\n", cc_port);
-    if (config_lookup_int(&cfg, "remote_port", &rmt_port))
-        log_msg(LOG_INFO, "Configured for remote comms port on %d.\n", rmt_port);
     if (config_lookup_int(&cfg, "mbufs", &n_mbufs))
         log_msg(LOG_INFO, "Configured for %d mbufs.\n", n_mbufs);
     if (config_lookup_int(&cfg, "ipversion", &i)) {
@@ -686,7 +692,8 @@ int main(int argc, char *argv[])
     struct sigevent             se;
     struct comms_query_s        client_query;
     struct comms_reply_s        client_response;
-    struct ifreq    ifr;
+    struct ifreq                ifr;
+    sem_t                       goodnight;
 
     i=0;
     if (argv[0][0] == '.' || argv[0][0] == '/') i++;
@@ -939,14 +946,14 @@ int main(int argc, char *argv[])
         }
     }
 
+    // Start comms thread
+    process_comms();
+
     if ((rc = reconnect_comms_to_server()) != 0) {
         exit_level1_cleanup();
         exit(rc);
     }
     
-    // Start remote comms handling
-    process_remote_comms();
-
     // Handshake with server, send helo message and wait for ack.
     if (ipv6_mode) {
         memcpy(&client_query.helo_data.egress_addr[0], &if_config[0].if_ipaddr, sizeof(struct sockaddr_in6));
@@ -983,9 +990,11 @@ int main(int argc, char *argv[])
     // Start up the client threads
     create_threads();
 
-    // Process comms until killed
-    process_comms();
+    log_msg(LOG_INFO, "%s daemon started.\n", progname);
     
-    exit_level1_cleanup();
-    exit(EXIT_SUCCESS);
+    // Go to sleep on a locked semaphore
+    sem_init(&goodnight, 0, 0);
+    sem_wait(&goodnight);
+    
+    exit(EFAULT);
 }

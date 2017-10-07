@@ -76,7 +76,7 @@ mempool                     mPool;
 bool                        wipebufs=false;
 int                         comms_peer_fd=-1;
 struct statistics_s         if_stats;
-unsigned int                cc_port=PORT, rmt_port=PORT;
+unsigned int                cc_port=PORT;
 struct thread_list_s        dsl_threads[((NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES)*2)+2];
 int                         thread_exit_rc;
 unsigned int                n_mbufs=DEFAULT_NUM_MBUFS;
@@ -185,7 +185,7 @@ int reconnect_comms_to_server(void)
             exit_level1_cleanup();
             exit(rc);
         }
-        comms_addr6.sin6_port       = htons((unsigned short)rmt_port);
+        comms_addr6.sin6_port       = htons((unsigned short)cc_port);
     } else {
         if ((name_to_ip(comms_name, (struct sockaddr_storage *) &comms_addr, AF_INET)) != 0)
         {
@@ -199,9 +199,9 @@ int reconnect_comms_to_server(void)
             exit_level1_cleanup();
             exit(rc);
         }
-        comms_addr.sin_port        = htons((unsigned short)rmt_port);
+        comms_addr.sin_port        = htons((unsigned short)cc_port);
     }
-    log_msg(LOG_INFO, "Waiting for connection to server %s on port %u...", comms_name, rmt_port);
+    log_msg(LOG_INFO, "Waiting for connection to server %s on port %u...", comms_name, cc_port);
     if (ipv6_mode) {
         if (connect(comms_peer_fd, (struct sockaddr *) &comms_addr6, sizeof(comms_addr6)) < 0) {
             rc = errno;
@@ -319,7 +319,7 @@ static void create_comms_channel(unsigned int port, int *commsfd)
 // +----------------------------------------------------------------------------
 // | Thread to handle remote communication channel
 // +----------------------------------------------------------------------------
-static void *remote_comms_thread(void *arg)
+static void *accept_comms_thread(void *arg)
 {
     struct comms_thread_parms_s *thread_parms  = (struct comms_thread_parms_s *) arg;
     int                         comms_client_fd;
@@ -525,73 +525,27 @@ void get_ip_addrs(void)
 
 
 // +----------------------------------------------------------------------------
-// | Process remote comms port
-// +----------------------------------------------------------------------------
-void process_remote_comms(void)
-{
-    struct comms_thread_parms_s *comms_thread_parms;
-    int                         rc;
-    int                         rmt_commsfd;
-    
-    // Open remote communication channel
-    create_comms_channel(rmt_port, &rmt_commsfd);
-    // Create thread to handle remote comms requests
-    if ((comms_thread_parms = (struct comms_thread_parms_s *) malloc(sizeof(struct comms_thread_parms_s))) == NULL) {
-        log_msg(LOG_ERR, "%s-%d: Out of memory.\n", __FUNCTION__, __LINE__);
-        exit_level1_cleanup();
-        exit(ENOMEM);
-    }
-    comms_thread_parms->peer_fd = rmt_commsfd;
-    if ((rc = create_thread(&comms_thread_parms->thread_id, remote_comms_thread, 1, "rmt_comms_thread", (void *) comms_thread_parms)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create remote comms thread - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
-    }
-}
-
-
-// +----------------------------------------------------------------------------
 // | Process local comms port
 // +----------------------------------------------------------------------------
 void process_comms(void)
 {
-    int                         rc, comms_client_fd;
-    socklen_t                   sin_size;
-    struct sockaddr_in6         comms_client_addr6;
-    struct sockaddr_in          comms_client_addr;
-    char                        ipaddr[INET6_ADDRSTRLEN];
+    int                         rc;
     struct comms_thread_parms_s *comms_thread_parms;
     int                         commsfd;
+    char                        ipaddr[INET6_ADDRSTRLEN];
     
     // Open local communication channel
     create_comms_channel(cc_port, &commsfd);
 
-    log_msg(LOG_INFO, "%s daemon started.\n", progname);
-
-    for(;;) {
-        if (ipv6_mode) {
-            sin_size = sizeof(comms_client_addr6);
-            if ((comms_client_fd = accept(commsfd, (struct sockaddr *)&comms_client_addr6, &sin_size)) < 0) {
-                log_msg(LOG_ERR, "%s-%d: Error accepting comms connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-                continue;
-            }
-            inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&comms_client_addr6), ipaddr, sizeof ipaddr);
-        } else {
-            sin_size = sizeof(comms_client_addr);
-            if ((comms_client_fd = accept(commsfd, (struct sockaddr *)&comms_client_addr, &sin_size)) < 0) {
-                log_msg(LOG_ERR, "%s-%d: Error accepting comms connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-                continue;
-            }
-            inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&comms_client_addr), ipaddr, sizeof ipaddr);
-        }
-        log_msg(LOG_INFO, "Accepted connection from %s.\n", ipaddr);
-        if ((comms_thread_parms = (struct comms_thread_parms_s *) malloc(sizeof(struct comms_thread_parms_s))) == NULL) {
-            log_msg(LOG_ERR, "%s-%d: Out of memory.\n", __FUNCTION__, __LINE__);
-            close(comms_client_fd);
-            continue;
-        }
-        comms_thread_parms->peer_fd = comms_client_fd;
-        if ((rc = create_thread(&comms_thread_parms->thread_id, comms_thread, 1, "comms_thread", (void *) comms_thread_parms)) != 0) {
-            log_msg(LOG_ERR, "%s-%d: Can not create comms thread for connection from %s - %s.\n", __FUNCTION__, __LINE__, ipaddr, strerror(rc));
-        }
+    if ((comms_thread_parms = (struct comms_thread_parms_s *) malloc(sizeof(struct comms_thread_parms_s))) == NULL) {
+        log_msg(LOG_ERR, "%s-%d: Out of memory.\n", __FUNCTION__, __LINE__);
+        close(commsfd);
+        exit_level1_cleanup();
+        exit(ENOMEM);
+    }
+    comms_thread_parms->peer_fd = commsfd;
+    if ((rc = create_thread(&comms_thread_parms->thread_id, accept_comms_thread, 1, "comms_thread", (void *) comms_thread_parms)) != 0) {
+        log_msg(LOG_ERR, "%s-%d: Can not create comms thread for connection from %s - %s.\n", __FUNCTION__, __LINE__, ipaddr, strerror(rc));
     }
 }
 
