@@ -165,22 +165,9 @@ static void *rx_thread(void * arg)
 {
     struct if_queue_s   *rxq = (struct if_queue_s *) arg;
     struct mbuf_s       *mbuf=NULL;
-    unsigned char       *mbufc;
     ssize_t             rxSz;
-    struct ether_header *ethhdr;
-    uint8_t             broadcast_mac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
-    struct ip6_hdr      *ip6hdr;
-    int                 i;
-    struct ip           *iphdr;
-    uint32_t            private_start[3], private_end[3];
 
-    inet_pton(AF_INET, "10.0.0.0", &private_start[0]);
-    inet_pton(AF_INET, "172.16.0.0", &private_start[1]);
-    inet_pton(AF_INET, "192.168.0.0", &private_start[2]);
-    private_end[0]  = private_start[0] | 0x00FFFFFF;
-    private_end[1]  = private_start[1] | 0x00000FFF;
-    private_end[2]  = private_start[2] | 0x0000FFFF;
-
+    log_debug_msg(LOG_INFO, "%s-%d: Rx thread on interface %s started.\n", __FUNCTION__, __LINE__, if_config[rxq->if_index].if_rxname);
     while (rxq->if_thread->keep_going) {
         if (mbuf == NULL) mbuf = (struct mbuf_s*) mempool_alloc(mPool);
         if (mbuf == NULL) {
@@ -191,15 +178,22 @@ static void *rx_thread(void * arg)
         while (((rxSz = read(if_config[rxq->if_index].if_rx_fd, (void *) mbuf, sizeof(union mbuf_u))) < 0) && (errno == EINTR));
         if (rxSz < 0) {
             log_msg(LOG_ERR, "%s-%d: Error reading raw packets from interface %s - %s",
-                    __FUNCTION__, __LINE__, if_config[rxq->if_index].if_name, strerror(errno));
+                    __FUNCTION__, __LINE__, if_config[rxq->if_index].if_rxname, strerror(errno));
             continue;
         }
         mbuf->if_index = rxq->if_index;
+
+        // ignore packets from egress interfaces with if_ratio = 0
+        if ((rxq->if_index == EGRESS_IF || rxq->if_index == EGRESS_IF+1) && if_config[rxq->if_index].if_ratio == 0) {
+            if_stats.if_dropped_pkts_ratio[rxq->if_index]++;
+            continue;
+        }
+
         switch (mbuf->pkt.tcp_pkt.eth_hdr.ether_type) {
             case ETHERTYPE_IPV6:
                 if (!ipv6_mode) {
                     // not ipv6 mode so drop the packet
-                    if_stats.if_dropped_pkts[rxq->if_index]++;
+                    if_stats.if_dropped_pkts_v4v6[rxq->if_index]++;
                     continue;
                 }
                 mbuf->ipv6 = true;
@@ -207,7 +201,7 @@ static void *rx_thread(void * arg)
             case ETHERTYPE_IP:
                 if (ipv6_mode) {
                     // not ipv4 mode so drop the packet
-                    if_stats.if_dropped_pkts[rxq->if_index]++;
+                    if_stats.if_dropped_pkts_v4v6[rxq->if_index]++;
                     continue;
                 }
                 mbuf->ipv6 = false;
@@ -216,47 +210,13 @@ static void *rx_thread(void * arg)
                 if_stats.if_dropped_pkts[rxq->if_index]++;
                 continue;
         }
-        mbufc = (unsigned char *) mbuf;
         clock_gettime(CLOCK_MONOTONIC, &mbuf->rx_time);
-
-        // ignore packets from egress interfaces with if_ratio = 0
-        if ((rxq->if_index == EGRESS_IF || rxq->if_index == EGRESS_IF+1) && if_config[rxq->if_index].if_ratio == 0) {
-            if_stats.if_dropped_pkts[rxq->if_index]++;
-            continue;
-        }
-
-        // ignore broadcast packets
-        ethhdr = (struct ether_header *) mbufc;
-        if (memcmp(ethhdr->ether_dhost, broadcast_mac, 6) == 0) {
-            if_stats.if_dropped_pkts[rxq->if_index]++;
-            continue;
-        }
-
-
-        if (mbuf->ipv6) {
-            ip6hdr = (struct ip6_hdr *) (mbufc + sizeof(struct ether_header));
-            if (ip6hdr->ip6_src.s6_addr[11] == 0xFF && ip6hdr->ip6_src.s6_addr[12] == 0xFE) {
-                // This packet is sourced from a device in the home, so drop it
-                if_stats.if_dropped_pkts[rxq->if_index]++;
-                continue;
-            }
-        } else {
-            iphdr = (struct ip *) (mbufc + sizeof(struct ether_header));
-            for (i=0; i<3; i++) {
-                // ignore packets whose source is in the private address range on the client
-                if ((iphdr->ip_src.s_addr >= private_start[i]) && (iphdr->ip_src.s_addr <= private_end[i])) {
-                    if_stats.if_dropped_pkts[rxq->if_index]++;
-                    break;
-                }
-            }
-            if (i<3) continue;
-        }
 
         // For debugging purposes, we have queue control that will only let a set number
         // of packets through
         if (rxq->q_control) {
             if (!rxq->q_control_cnt) {
-                if_stats.if_dropped_pkts[rxq->if_index]++;
+                if_stats.if_dropped_pkts_qcontrol[rxq->if_index]++;
                 continue;
             }
             rxq->q_control_cnt--;
@@ -272,6 +232,7 @@ static void *rx_thread(void * arg)
 
     thread_exit_rc = 0;
     pthread_exit(&thread_exit_rc);
+    return &thread_exit_rc;   // for compiler warnings
 }
 
 // +----------------------------------------------------------------------------
@@ -321,6 +282,7 @@ static void *home_to_vps_pkt_mangler_thread(void * arg)
 
     thread_exit_rc = 0;
     pthread_exit(&thread_exit_rc);
+    return &thread_exit_rc; // for compiler warnings
 }
 
 
@@ -450,6 +412,7 @@ static void *home_from_vps_pkt_mangler_thread(void * arg)
 
     thread_exit_rc = 0;
     pthread_exit(&thread_exit_rc);
+    return &thread_exit_rc;  // for compiler warnings
 }
 
 
@@ -462,53 +425,46 @@ static int create_threads(void)
 
     snprintf(dsl_threads[0].thread_name, 16, "rx_thread0");
     if ((rc = create_thread(&dsl_threads[0].thread_id, rx_thread, RXPRIO, dsl_threads[0].thread_name, (void *) &if_config[0].if_rxq)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create rx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[0].if_name, strerror(rc));
-        exit_level1_cleanup();
-        exit(rc);
+        log_msg(LOG_ERR, "%s-%d: Can not create rx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[0].if_rxname, strerror(rc));
+        return rc;
     }
     snprintf(dsl_threads[1].thread_name, 16, "rx_thread1");
     if ((rc = create_thread(&dsl_threads[1].thread_id, rx_thread, RXPRIO, dsl_threads[1].thread_name, (void *) &if_config[1].if_rxq)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create rx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[1].if_name, strerror(rc));
-        exit_level1_cleanup();
-        exit(rc);
+        log_msg(LOG_ERR, "%s-%d: Can not create rx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[1].if_rxname, strerror(rc));
+        return rc;
     }
     snprintf(dsl_threads[2].thread_name, 16, "rx_thread2");
     if ((rc = create_thread(&dsl_threads[2].thread_id, rx_thread, RXPRIO, dsl_threads[2].thread_name, (void *) &if_config[2].if_rxq)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create rx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[2].if_name, strerror(rc));
-        exit_level1_cleanup();
-        exit(rc);
+        log_msg(LOG_ERR, "%s-%d: Can not create rx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[2].if_rxname, strerror(rc));
+        return rc;
     }
     snprintf(dsl_threads[3].thread_name, 16, "tx_thread0");
     if ((rc = create_thread(&dsl_threads[3].thread_id, tx_thread, TXPRIO, dsl_threads[3].thread_name, (void *) &if_config[0].if_txq)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create tx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[0].if_name, strerror(rc));
-        exit_level1_cleanup();
-        exit(rc);
+        log_msg(LOG_ERR, "%s-%d: Can not create tx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[0].if_txname, strerror(rc));
+        return rc;
     }
     snprintf(dsl_threads[4].thread_name, 16, "tx_thread1");
     if ((rc = create_thread(&dsl_threads[4].thread_id, tx_thread, TXPRIO, dsl_threads[4].thread_name, (void *) &if_config[1].if_txq)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create tx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[1].if_name, strerror(rc));
-        exit_level1_cleanup();
-        exit(rc);
+        log_msg(LOG_ERR, "%s-%d: Can not create tx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[1].if_txname, strerror(rc));
+        return rc;
     }
     snprintf(dsl_threads[5].thread_name, 16, "tx_thread2");
     if ((rc = create_thread(&dsl_threads[5].thread_id, tx_thread, TXPRIO, dsl_threads[5].thread_name, (void *) &if_config[2].if_txq)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create tx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[2].if_name, strerror(rc));
-        exit_level1_cleanup();
-        exit(rc);
+        log_msg(LOG_ERR, "%s-%d: Can not create tx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[2].if_txname, strerror(rc));
+        return rc;
     }
     snprintf(dsl_threads[HOME_TO_VPS_PKT_MANGLER_THREADNO].thread_name, 16, "home_to_vps");
     if ((rc = create_thread(&dsl_threads[HOME_TO_VPS_PKT_MANGLER_THREADNO].thread_id, home_to_vps_pkt_mangler_thread, HOME_TO_VPS_PRIO, dsl_threads[HOME_TO_VPS_PKT_MANGLER_THREADNO].thread_name, NULL)) != 0) {
         log_msg(LOG_ERR, "%s-%d: Can not create home to vps thread - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
-        exit_level1_cleanup();
-        exit(rc);
+        return rc;
     }
     snprintf(dsl_threads[HOME_FROM_VPS_PKT_MANGLER_THREADNO].thread_name, 16, "home_from_vps");
     if ((rc = create_thread(&dsl_threads[HOME_FROM_VPS_PKT_MANGLER_THREADNO].thread_id, home_from_vps_pkt_mangler_thread, HOME_FROM_VPS_PRIO, dsl_threads[HOME_FROM_VPS_PKT_MANGLER_THREADNO].thread_name, NULL)) != 0) {
         log_msg(LOG_ERR, "%s-%d: Can not create home from vps thread - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
-        exit_level1_cleanup();
-        exit(rc);
+        return rc;
     }
     num_threads = 8;
+    return 0;
 }
 
 // +----------------------------------------------------------------------------
@@ -521,13 +477,13 @@ void handle_client_query(struct comms_query_s *query, int comms_client_fd, bool 
     char                    *query_c = (char *) query;
     char                    *reply_c = (char *) &reply;
 
-    log_debug_msg(LOG_INFO, "Received request %02x.\n", query->cmd);
+//    log_debug_msg(LOG_INFO, "Received request %02x.\n", query->cmd);
     if (query->for_peer) {
-        log_debug_msg(LOG_INFO, "Request is for peer.\n");
+//        log_debug_msg(LOG_INFO, "Request is for peer.\n");
         if (comms_addr_valid) {
             query->for_peer = false;
             bytecnt = 0;
-            log_debug_msg(LOG_INFO, "Sending request to peer.\n");
+//            log_debug_msg(LOG_INFO, "Sending request to peer.\n");
             do {
                 if ((rc = send(comms_peer_fd, &query_c[bytecnt], sizeof(struct comms_query_s)-bytecnt, 0)) == -1) {
                     log_msg(LOG_ERR, "%s-%d: Error sending comms request to remote peer - %s", __FUNCTION__, __LINE__, strerror(errno));
@@ -547,7 +503,7 @@ void handle_client_query(struct comms_query_s *query, int comms_client_fd, bool 
                 }
                 bytecnt += rc;
             } while (bytecnt < sizeof(struct comms_reply_s));
-            log_debug_msg(LOG_INFO, "Received reply from peer, rc=%d.\n", reply.rc);
+//            log_debug_msg(LOG_INFO, "Received reply from peer, rc=%d.\n", reply.rc);
             reply.rc = 0;
         } else {
             reply.rc = 1;
@@ -647,9 +603,15 @@ static void read_config_file(void)
         log_msg(LOG_INFO, "Configured for comms on %s.\n", comms_name);
     }
     config_string = NULL;
-    if (config_lookup_string(&cfg, "client.ingress", &config_string)) {
-        strcpy(if_config[INGRESS_IF].if_name, config_string);
-        log_msg(LOG_INFO, "Configured for client ingress on %s.\n", if_config[INGRESS_IF].if_name);
+    if (config_lookup_string(&cfg, "client.ingress.input", &config_string)) {
+        strcpy(if_config[INGRESS_IF].if_rxname, config_string);
+        log_msg(LOG_INFO, "Configured for client ingress rx on %s.\n", if_config[INGRESS_IF].if_rxname);
+        ingresscnt = 1;
+    }
+    config_string = NULL;
+    if (config_lookup_string(&cfg, "client.ingress.output", &config_string)) {
+        strcpy(if_config[INGRESS_IF].if_txname, config_string);
+        log_msg(LOG_INFO, "Configured for client ingress tx on %s.\n", if_config[INGRESS_IF].if_txname);
         ingresscnt = 1;
     }
     config_string = NULL;
@@ -661,18 +623,24 @@ static void read_config_file(void)
         strcpy(remote_name, config_string);
         log_msg(LOG_INFO, "Configured for server name %s.\n", remote_name);
     }
-    config_egress_list = config_lookup(&cfg, "client.egress.interface");
+    config_egress_list = config_lookup(&cfg, "client.egress.input");
     for (i=EGRESS_IF, j=0; i<config_setting_length(config_egress_list); i++, j++) {
         if (j == 2) break;  // no more than two egress interfaces
         egresscnt++;
-        strcpy(if_config[i].if_name, config_setting_get_string_elem(config_egress_list, j));
-        log_msg(LOG_INFO, "Configured for client egress interface on %s.\n", if_config[i].if_name);
+        strcpy(if_config[i].if_rxname, config_setting_get_string_elem(config_egress_list, j));
+        log_msg(LOG_INFO, "Configured for client egress rx interface on %s.\n", if_config[i].if_rxname);
+    }
+    config_egress_list = config_lookup(&cfg, "client.egress.output");
+    for (i=EGRESS_IF, j=0; i<config_setting_length(config_egress_list); i++, j++) {
+        if (j == 2) break;  // no more than two egress interfaces
+        strcpy(if_config[i].if_txname, config_setting_get_string_elem(config_egress_list, j));
+        log_msg(LOG_INFO, "Configured for client egress tx interface on %s.\n", if_config[i].if_txname);
     }
     config_egress_list = config_lookup(&cfg, "client.egress.ratio");
     for (i=EGRESS_IF, j=0; i<config_setting_length(config_egress_list); i++, j++) {
         if (j == egresscnt) break; // no more than 2 interface ratios
         if_config[i].if_ratio = config_setting_get_int_elem(config_egress_list, j);
-        log_msg(LOG_INFO, "Configured for client egress interface ratio of %u on %s.\n", if_config[i].if_ratio, if_config[i].if_name);
+        log_msg(LOG_INFO, "Configured for client egress interface ratio of %u on %s.\n", if_config[i].if_ratio, if_config[i].if_txname);
     }
 
     config_destroy(&cfg);
@@ -815,27 +783,11 @@ int main(int argc, char *argv[])
     // Get ip addresses of all the interfaces
     get_ip_addrs();
     
-    // Open raw socket for inress tx interface, opened in IP mode so we don't have to
+    // Open raw socket for ingress tx interface, opened in IP mode so we don't have to
     // provide the ethernet header.
-    if (ipv6_mode) {
-        if ((if_config[INGRESS_IF].if_tx_fd = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW)) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not create tx socket for ingress interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-    } else {
-        if ((if_config[INGRESS_IF].if_tx_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not create tx socket for ingress interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-    }
-    // Set flag so socket expects us to provide IP header on egress tx socket.
-    if (setsockopt (if_config[INGRESS_IF].if_tx_fd, IPPROTO_IP, IP_HDRINCL, &(int){ 1 }, sizeof(int)) < 0) {
+    if ((if_config[INGRESS_IF].if_tx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP))) < 0) {
         rc = errno;
-        log_msg(LOG_ERR, "%s-%d: Can not set ip header socket option for ingress interface - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+        log_msg(LOG_ERR, "%s-%d: Can not create tx socket for ingress interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
         exit_level1_cleanup();
         exit(rc);
     }
@@ -844,7 +796,7 @@ int main(int argc, char *argv[])
         ifr.ifr_addr.sa_family = AF_INET6;
     else
         ifr.ifr_addr.sa_family = AF_INET;
-    strncpy(ifr.ifr_name, if_config[INGRESS_IF].if_name, sizeof(ifr.ifr_name));
+    strncpy(ifr.ifr_name, if_config[INGRESS_IF].if_txname, sizeof(ifr.ifr_name));
     // Bind raw socket to a particular interface name (eg: ppp0 or ppp1)
     if (setsockopt(if_config[INGRESS_IF].if_tx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
         rc = errno;
@@ -854,28 +806,19 @@ int main(int argc, char *argv[])
     }
     // Open ingress rx socket interface, this socket is opened such that we get the ethernet
     // header as well as the ip header
-    if (ipv6_mode) {
-        if ((if_config[INGRESS_IF].if_rx_fd = socket(AF_INET6, SOCK_RAW, ETH_P_ALL)) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not create rx socket for ingress rx interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-    } else {
-        if ((if_config[INGRESS_IF].if_rx_fd = socket(AF_INET, SOCK_RAW, ETH_P_ALL)) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not create rx socket for ingress rx interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-    }
-    // Bind raw socket to a particular interface name (eg: ppp0 or ppp1)
-    if (setsockopt(if_config[INGRESS_IF].if_rx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
+    if ((if_config[INGRESS_IF].if_rx_fd = tuntap_init(if_config[INGRESS_IF].if_rxname)) < 0) {
         rc = errno;
-        log_msg(LOG_ERR, "%s-%d: Can not bind socket to %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
+        log_msg(LOG_ERR, "%s-%d: Can not create rx socket for ingress rx interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
         exit_level1_cleanup();
         exit(rc);
     }
+    // Bind raw socket to a particular interface name (eg: ppp0 or ppp1)
+//    if (setsockopt(if_config[INGRESS_IF].if_rx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
+//        rc = errno;
+//        log_msg(LOG_ERR, "%s-%d: Can not bind socket to %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
+//        exit_level1_cleanup();
+//        exit(rc);
+//    }
 
     // Create the rx and tx queues for ingress interface
     if_config[INGRESS_IF].if_rxq.if_index  = INGRESS_IF;
@@ -984,11 +927,14 @@ int main(int argc, char *argv[])
     if_stats.num_interfaces = 3;
     if_stats.ipv6_mode      = ipv6_mode;
     for (i=0; i<if_stats.num_interfaces; i++) {
-        strncpy(if_stats.if_name[i], if_config[i].if_name, IFNAMSIZ);
+        strncpy(if_stats.if_name[i], if_config[i].if_txname, IFNAMSIZ);
     }
 
     // Start up the client threads
-    create_threads();
+    if (create_threads()) {
+        exit_level1_cleanup();
+    	exit(EFAULT);
+    }
 
     log_msg(LOG_INFO, "%s daemon started.\n", progname);
     

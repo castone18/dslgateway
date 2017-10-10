@@ -102,7 +102,8 @@ struct comms_thread_parms_s {
 struct if_config_s {
     int                     if_rx_fd;
     int                     if_tx_fd;
-    char                    if_name[IFNAMSIZ];
+    char                    if_rxname[IFNAMSIZ];
+    char                    if_txname[IFNAMSIZ];
     struct if_queue_s       if_rxq;
     struct if_queue_s       if_txq;
     uint8_t                 if_ratio;
@@ -121,6 +122,7 @@ void usage(char *progname);
 void handle_client_query(struct comms_query_s *query, int comms_client_fd, bool *connection_active);
 unsigned short iphdr_checksum(unsigned short* buff, int _16bitword);
 void process_remote_comms(void);
+int tuntap_init(char *ifname);
 
 #ifdef __cplusplus
 }

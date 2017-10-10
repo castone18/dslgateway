@@ -107,9 +107,8 @@
 
 extern char                     *progname;
 extern struct if_config_s       if_config[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-extern unsigned int             egresscnt, ingresscnt;
+extern unsigned int             egresscnt;
 extern mempool                  mPool;
-extern bool                     wipebufs;
 extern int                      comms_peer_fd;
 extern struct statistics_s      if_stats;
 extern unsigned int             cc_port;
@@ -155,10 +154,10 @@ static void *rx_thread(void * arg)
             continue;
         }
         // TODO: deal with partial packet receipt
-        while (((rxSz = read(if_config[rxq->if_index].if_rx_fd, (void *) mbuf, sizeof(union mbuf_u))) < 0) && (errno == EINTR));
+        while (((rxSz = recv(if_config[rxq->if_index].if_rx_fd, (void *) mbuf, sizeof(union mbuf_u), 0)) < 0) && (errno == EINTR));
         if (rxSz < 0) {
             log_msg(LOG_ERR, "%s-%d: Error reading raw packets from interface %s - %s",
-                    __FUNCTION__, __LINE__, if_config[rxq->if_index].if_name, strerror(errno));
+                    __FUNCTION__, __LINE__, if_config[rxq->if_index].if_rxname, strerror(errno));
             continue;
         }
         mbuf->if_index = rxq->if_index;
@@ -244,6 +243,7 @@ static void *rx_thread(void * arg)
 
     thread_exit_rc = 0;
     pthread_exit(&thread_exit_rc);
+    return &thread_exit_rc; // for compiler warnings
 }
 
 
@@ -322,6 +322,7 @@ static void *vps_pkt_mangler_thread(void * arg)
 
     thread_exit_rc = 0;
     pthread_exit(&thread_exit_rc);
+    return &thread_exit_rc; // for compiler warnings
 }
 
 
@@ -334,24 +335,22 @@ static int create_threads(void)
     
     snprintf(dsl_threads[0].thread_name, 16, "rx_thread");
     if ((rc = create_thread(&dsl_threads[0].thread_id, rx_thread, RXPRIO, dsl_threads[0].thread_name, (void *) &if_config[EGRESS_IF].if_rxq)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create rx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[EGRESS_IF].if_name, strerror(rc));
-        exit_level1_cleanup();
-        exit(rc);
+        log_msg(LOG_ERR, "%s-%d: Can not create rx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[EGRESS_IF].if_rxname, strerror(rc));
+        return rc;
     }
     snprintf(dsl_threads[1].thread_name, 16, "tx_thread");
     if ((rc = create_thread(&dsl_threads[1].thread_id, tx_thread, TXPRIO, dsl_threads[1].thread_name, (void *) &if_config[EGRESS_IF].if_txq)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create tx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[EGRESS_IF].if_name, strerror(rc));
-        exit_level1_cleanup();
-        exit(rc);
+        log_msg(LOG_ERR, "%s-%d: Can not create tx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[EGRESS_IF].if_txname, strerror(rc));
+        return rc;
     }
     snprintf(dsl_threads[VPS_PKT_MANGLER_THREADNO].thread_name, 16, "vps_pkt_mangler");
     if ((rc = create_thread(&dsl_threads[VPS_PKT_MANGLER_THREADNO].thread_id, vps_pkt_mangler_thread, VPS_PKT_MANGLER_PRIO, dsl_threads[VPS_PKT_MANGLER_THREADNO].thread_name, NULL)) != 0) {
         log_msg(LOG_ERR, "%s-%d: Can not create vps packet mangler thread - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
-        exit_level1_cleanup();
-        exit(rc);
+        return rc;
     }
 
     num_threads = 3;
+    return 0;
 }
 
 
@@ -511,9 +510,16 @@ static void read_config_file(void)
         strcpy(comms_name, config_string);
         log_msg(LOG_INFO, "Configured for comms on %s.\n", comms_name);
     }
-    if (config_lookup_string(&cfg, "server.interface", &config_string)) {
-        strcpy(if_config[EGRESS_IF].if_name, config_string);
-        log_msg(LOG_INFO, "Configured for server interface on %s.\n", if_config[EGRESS_IF].if_name);
+    config_string = NULL;
+    if (config_lookup_string(&cfg, "server.input", &config_string)) {
+        strcpy(if_config[EGRESS_IF].if_rxname, config_string);
+        log_msg(LOG_INFO, "Configured for server rx interface on %s.\n", if_config[EGRESS_IF].if_rxname);
+        egresscnt = 1;
+    }
+    config_string = NULL;
+    if (config_lookup_string(&cfg, "server.output", &config_string)) {
+        strcpy(if_config[EGRESS_IF].if_txname, config_string);
+        log_msg(LOG_INFO, "Configured for server tx interface on %s.\n", if_config[EGRESS_IF].if_txname);
         egresscnt = 1;
     }
 
@@ -647,11 +653,14 @@ int main(int argc, char *argv[])
     if_stats.num_interfaces = 1;
     if_stats.ipv6_mode      = ipv6_mode;
     for (i=0; i<if_stats.num_interfaces; i++) {
-        strncpy(if_stats.if_name[i], if_config[i].if_name, IFNAMSIZ);
+        strncpy(if_stats.if_name[i], if_config[i].if_txname, IFNAMSIZ);
     }
 
     // Start up the server threads
-    create_threads();
+    if (create_threads()) {
+        exit_level1_cleanup();
+    	exit(EFAULT);
+    }
 
     // Start comms thread
     process_comms();

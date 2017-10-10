@@ -146,7 +146,7 @@ void *tx_thread(void * arg)
         }
         if (txSz == -1) {
             log_msg(LOG_ERR, "%s-%d: Error sending ip packet on interface %s - %s.\n",
-                    __FUNCTION__, __LINE__, if_config[txq->if_index].if_name, strerror(errno));
+                    __FUNCTION__, __LINE__, if_config[txq->if_index].if_txname, strerror(errno));
         }
         mempool_free(mPool, mbuf, wipebufs);
         if_stats.if_tx_pkts[txq->if_index]++;
@@ -155,6 +155,7 @@ void *tx_thread(void * arg)
 
     thread_exit_rc = 0;
     pthread_exit(&thread_exit_rc);
+    return &thread_exit_rc;  // for compiler warnings
 }
 
 
@@ -249,6 +250,7 @@ static void *comms_thread(void *arg)
     close(thread_parms->peer_fd);
     free(thread_parms);
     pthread_exit(NULL);
+    return NULL; // for compiler warnings
 }
 
 
@@ -356,50 +358,45 @@ static void *accept_comms_thread(void *arg)
         }
     }
     pthread_exit(NULL);
+    return NULL; // for compiler warnings
 }
 
 
 // +----------------------------------------------------------------------------
-// | Open egress interfaces, allocate rx and tx circular buffers for egress 
-// | interfaces. Note there are two egress interfaces on the home gateway, and 
+// | Open egress interfaces, allocate rx and tx circular buffers for egress
+// | interfaces. Note there are two egress interfaces on the home gateway, and
 // | one on the vps
 // +----------------------------------------------------------------------------
 void open_egress_interfaces(void)
 {
     int             i, rc;
     struct ifreq    ifr;
-    
+
     for (i=0; i<egresscnt; i++) {
         // Open raw socket for egress tx interface, opened in IP mode so we don't have to
         // provide the ethernet header.
-        if (ipv6_mode) {
-            if ((if_config[i].if_tx_fd = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW)) < 0) {
-                rc = errno;
-                log_msg(LOG_ERR, "%s-%d: Can not create socket for egress interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
-                exit_level1_cleanup();
-                exit(rc);
-            }
-        } else {
-            if ((if_config[i].if_tx_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0) {
-                rc = errno;
-                log_msg(LOG_ERR, "%s-%d: Can not create socket for egress interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
-                exit_level1_cleanup();
-                exit(rc);
-            }
-        }
-        // Set flag so socket expects us to provide IP header on egress tx socket.
-        if (setsockopt (if_config[i].if_tx_fd, IPPROTO_IP, IP_HDRINCL, &(int){ 1 }, sizeof(int)) < 0) {
+        if ((if_config[i].if_tx_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0) {
             rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not set ip header socket option for egress interface - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            log_msg(LOG_ERR, "%s-%d: Can not create socket for egress interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
             exit_level1_cleanup();
             exit(rc);
         }
         memset(&ifr, 0, sizeof(ifr));
-        if (ipv6_mode)
-            ifr.ifr_addr.sa_family = AF_INET6;
-        else
-            ifr.ifr_addr.sa_family = AF_INET;
-        strncpy(ifr.ifr_name, if_config[i].if_name, sizeof(ifr.ifr_name));
+        strncpy(ifr.ifr_name, if_config[i].if_txname, sizeof(ifr.ifr_name));
+        // Get interface if index
+        if (ioctl (if_config[i].if_tx_fd, SIOCGIFINDEX, &ifr) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Can not get interface index for %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        }
+        // Set flag that indicates we will be providing IP header
+        if (setsockopt (if_config[i].if_tx_fd, IPPROTO_IP, IP_HDRINCL, &(int){ 1 }, sizeof(int)) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Can not set IP_HDRINCL socket option for %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        }
         // Bind raw socket to a particular interface name (eg: ppp0 or ppp1)
         if (setsockopt(if_config[i].if_tx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
             rc = errno;
@@ -407,22 +404,23 @@ void open_egress_interfaces(void)
             exit_level1_cleanup();
             exit(rc);
         }
+        log_debug_msg(LOG_INFO, "%s-%d: Interface %d tx bound to %s.\n", __FUNCTION__, __LINE__, i, ifr.ifr_name);
         // Open egress rx socket interface, this socket is opened such that we get the ethernet
         // header as well as the ip header
-        if (ipv6_mode) {
-            if ((if_config[i].if_rx_fd = socket(AF_INET6, SOCK_RAW, ETH_P_ALL)) < 0) {
-                rc = errno;
-                log_msg(LOG_ERR, "%s-%d: Can not create socket for egress rx interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
-                exit_level1_cleanup();
-                exit(rc);
-            }
-        } else {
-            if ((if_config[i].if_rx_fd = socket(AF_INET, SOCK_RAW, ETH_P_ALL)) < 0) {
-                rc = errno;
-                log_msg(LOG_ERR, "%s-%d: Can not create socket for egress rx interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
-                exit_level1_cleanup();
-                exit(rc);
-            }
+        if ((if_config[i].if_rx_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Can not create socket for egress rx interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        }
+        memset(&ifr, 0, sizeof(ifr));
+        strncpy(ifr.ifr_name, if_config[i].if_rxname, sizeof(ifr.ifr_name));
+        // Get interface if index
+        if (ioctl (if_config[i].if_rx_fd, SIOCGIFINDEX, &ifr) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Can not get interface index for %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
         }
         // Bind raw socket to a particular interface name (eg: ppp0 or ppp1)
         if (setsockopt(if_config[i].if_rx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
@@ -431,10 +429,11 @@ void open_egress_interfaces(void)
             exit_level1_cleanup();
             exit(rc);
         }
+        log_debug_msg(LOG_INFO, "%s-%d: Interface %d rx bound to %s.\n", __FUNCTION__, __LINE__, i, ifr.ifr_name);
         // Setup the rx queue
         if_config[i].if_rxq.if_index  = i;
         if_config[i].if_rxq.if_thread = &dsl_threads[i*2];
-        if (i == 0) {
+        if (i == EGRESS_IF) {
             // Only create one circular buffer and semaphore for both rx queues
             if ((if_config[i].if_rxq.if_pkts = circular_buffer_create(n_mbufs/(ingresscnt+egresscnt), mPool)) == CIRCULAR_BUFFER_INVALID) {
                 log_msg(LOG_ERR, "%s-%d: Failure to create rx circular buffer for index %d.\n", __FUNCTION__, __LINE__, i);
@@ -448,8 +447,8 @@ void open_egress_interfaces(void)
                 exit(rc);
             }
         } else {
-            if_config[i].if_rxq.if_pkts   = if_config[0].if_rxq.if_pkts;
-            if_config[i].if_rxq.if_ready  = if_config[0].if_rxq.if_ready;
+            if_config[i].if_rxq.if_pkts   = if_config[EGRESS_IF].if_rxq.if_pkts;
+            if_config[i].if_rxq.if_ready  = if_config[EGRESS_IF].if_rxq.if_ready;
         }
         if (q_control_on) {
             if_config[i].if_rxq.q_control       = true;
@@ -500,20 +499,20 @@ void get_ip_addrs(void)
             if (ipv6_mode) {
                 if (ifa_p->ifa_addr->sa_family == AF_INET6) {
                     for (i=0; i<egresscnt+ingresscnt; i++) {
-                        if (strcmp(if_config[i].if_name, ifa_p->ifa_name) == 0) {
+                        if (strcmp(if_config[i].if_txname, ifa_p->ifa_name) == 0) {
                             memcpy(&if_config[i].if_ipaddr, ifa_p->ifa_addr, sizeof(struct sockaddr_in6));
                             inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&if_config[i].if_ipaddr), ipaddr, sizeof(ipaddr));
-                            log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_config[i].if_name, ipaddr);
+                            log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_config[i].if_txname, ipaddr);
                         }
                     }
                 }
             } else {
                 if (ifa_p->ifa_addr->sa_family == AF_INET) {
                     for (i=0; i<egresscnt+ingresscnt; i++) {
-                        if (strcmp(if_config[i].if_name, ifa_p->ifa_name) == 0) {
+                        if (strcmp(if_config[i].if_txname, ifa_p->ifa_name) == 0) {
                             memcpy(&if_config[i].if_ipaddr, ifa_p->ifa_addr, sizeof(struct sockaddr_in));
                             inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&if_config[i].if_ipaddr), ipaddr, sizeof(ipaddr));
-                            log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_config[i].if_name, ipaddr);
+                            log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_config[i].if_txname, ipaddr);
                         }
                     }
                 }
@@ -533,7 +532,7 @@ void process_comms(void)
     struct comms_thread_parms_s *comms_thread_parms;
     int                         commsfd;
     char                        ipaddr[INET6_ADDRSTRLEN];
-    
+
     // Open local communication channel
     create_comms_channel(cc_port, &commsfd);
 
@@ -577,4 +576,42 @@ unsigned short iphdr_checksum(unsigned short* buff, int _16bitword)
     sum  = ((sum >> 16) + (sum & 0xFFFF));
     sum += (sum>>16);
     return (unsigned short)(~sum);
+}
+
+
+// +----------------------------------------------------------------------------
+// | Opens a tun interface. Returns fd of tun interface.
+// +----------------------------------------------------------------------------
+int tuntap_init(char *ifname)
+{
+    struct ifreq    ifr;
+    int             fd, rc;
+
+    if (ifname == NULL) return -1*EINVAL;
+
+    log_debug_msg(LOG_INFO, "%s-%d: Opening %s device.\n", __FUNCTION__, __LINE__, ifname);
+
+    if( (fd = open("/dev/net/tun" , O_RDWR)) < 0 ) {
+        log_msg(LOG_ERR, "%s-%d: Error opening /dev/net/tun - %s\n", __FUNCTION__, __LINE__, strerror(errno));
+        return -1*errno;
+    }
+
+    memset(&ifr, 0, sizeof(ifr));
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+
+    if (strlen(ifname) > 0) {
+        strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+    }
+
+    if((rc = ioctl(fd, TUNSETIFF, (void *)&ifr)) < 0) {
+        rc = -1*errno;
+        log_msg(LOG_ERR, "%s-%d: Error with ioctl(TUNSETIFF) - %s\n", __FUNCTION__, __LINE__, strerror(errno));
+        close(fd);
+        return rc;
+    }
+    if (strcmp(ifname, ifr.ifr_name) != 0)
+        strncpy(ifname, ifr.ifr_name, IFNAMSIZ);
+    log_debug_msg(LOG_INFO, "%s-%d: Opened %s device.\n", __FUNCTION__, __LINE__, ifr.ifr_name);
+
+    return fd;
 }

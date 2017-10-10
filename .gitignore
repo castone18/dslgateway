@@ -5,3 +5,5 @@ dslclient
 circular_buffer_ut
 mempool_ut
 nbproject/
+.cproject
+.project

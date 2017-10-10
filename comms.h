@@ -47,6 +47,9 @@ struct statistics_s {
     unsigned long long      if_tx_pkts[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
     unsigned long long      if_rx_bytes[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
     unsigned long long      if_tx_bytes[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
+    unsigned long long      if_dropped_pkts_ratio[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
+    unsigned long long      if_dropped_pkts_v4v6[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
+    unsigned long long      if_dropped_pkts_qcontrol[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
     unsigned long long      if_dropped_pkts[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
     unsigned int            mempool_totalsz;
     unsigned int            mempool_freesz;

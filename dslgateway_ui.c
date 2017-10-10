@@ -165,76 +165,123 @@ void get_ip_str(const struct sockaddr *sa, char *s, size_t maxlen)
     return;
 }
 
-static void print_stats(struct comms_reply_s *rply, char *name)
+static void print_stats(struct comms_reply_s *clnt_rply, struct comms_reply_s *srvr_rply)
 {
     char                client_ip_str[2][INET6_ADDRSTRLEN];
     struct sockaddr_in6 *addr6;
     struct sockaddr_in  *addr4;
 
-    printf("\n%s interface statistics:\n", name);
-    if (rply->stats.num_interfaces == 3) {
-        printf("                 %19s  %19s  %19s\n", rply->stats.if_name[EGRESS_IF],
-                rply->stats.if_name[EGRESS_IF+1], rply->stats.if_name[INGRESS_IF]);
-        printf("Rx Packets:      %19llu  %19llu  %19llu\n", rply->stats.if_rx_pkts[EGRESS_IF],
-                rply->stats.if_rx_pkts[EGRESS_IF+1], rply->stats.if_rx_pkts[INGRESS_IF]);
-        printf("Tx Packets:      %19llu  %19llu  %19llu\n", rply->stats.if_tx_pkts[EGRESS_IF],
-                rply->stats.if_tx_pkts[EGRESS_IF+1], rply->stats.if_tx_pkts[INGRESS_IF]);
-        printf("Rx Bytes:        %19llu  %19llu  %19llu\n", rply->stats.if_rx_bytes[EGRESS_IF],
-                rply->stats.if_rx_bytes[EGRESS_IF+1], rply->stats.if_rx_bytes[INGRESS_IF]);
-        printf("Tx Bytes:        %19llu  %19llu  %19llu\n", rply->stats.if_tx_bytes[EGRESS_IF],
-                rply->stats.if_tx_bytes[EGRESS_IF+1], rply->stats.if_tx_bytes[INGRESS_IF]);
-        printf("Dropped:         %19llu  %19llu  %19llu\n", rply->stats.if_dropped_pkts[EGRESS_IF],
-                rply->stats.if_dropped_pkts[EGRESS_IF+1], rply->stats.if_dropped_pkts[INGRESS_IF]);
-        printf("CBUF rxq sz:               %9u            %9u            %9u\n", rply->stats.circular_buffer_rxq_sz[EGRESS_IF],
-                rply->stats.circular_buffer_rxq_sz[EGRESS_IF+1], rply->stats.circular_buffer_rxq_sz[INGRESS_IF]);
-        printf("CBUF txq sz:               %9u            %9u            %9u\n", rply->stats.circular_buffer_txq_sz[EGRESS_IF],
-                rply->stats.circular_buffer_txq_sz[EGRESS_IF+1], rply->stats.circular_buffer_txq_sz[INGRESS_IF]);
-        printf("CBUF rxq freesz:           %9u            %9u            %9u\n", rply->stats.circular_buffer_rxq_freesz[EGRESS_IF],
-                rply->stats.circular_buffer_rxq_freesz[EGRESS_IF+1], rply->stats.circular_buffer_rxq_freesz[INGRESS_IF]);
-        printf("CBUF txq freesz:           %9u            %9u            %9u\n", rply->stats.circular_buffer_txq_freesz[EGRESS_IF],
-                rply->stats.circular_buffer_txq_freesz[EGRESS_IF+1], rply->stats.circular_buffer_txq_freesz[INGRESS_IF]);
-        printf("CBUF rxq ovhdsz:           %9u            %9u            %9u\n", rply->stats.circular_buffer_rxq_overheadsz[EGRESS_IF],
-                rply->stats.circular_buffer_rxq_overheadsz[EGRESS_IF+1], rply->stats.circular_buffer_rxq_overheadsz[INGRESS_IF]);
-        printf("CBUF txq ovhdsz:           %9u            %9u            %9u\n\n", rply->stats.circular_buffer_txq_overheadsz[EGRESS_IF],
-                rply->stats.circular_buffer_txq_overheadsz[EGRESS_IF+1], rply->stats.circular_buffer_txq_overheadsz[INGRESS_IF]);
-        printf("Reorders: %19llu  Reorder Failures: %19llu\n", rply->stats.reorders,
-                rply->stats.reorder_failures);
-        printf("Mempool total sz: %9u  free sz: %9u  overhead sz: %9u\n", rply->stats.mempool_totalsz,
-                rply->stats.mempool_freesz, rply->stats.mempool_overheadsz);
+    printf("\nInterface statistics:\n");
+    if (clnt_rply->stats.num_interfaces == 3) {
+        printf("                 %19s  %19s  %19s  %19s\n", clnt_rply->stats.if_name[EGRESS_IF],
+                clnt_rply->stats.if_name[EGRESS_IF+1], clnt_rply->stats.if_name[INGRESS_IF],
+				srvr_rply->stats.if_name[EGRESS_IF]);
+        printf("Rx Packets:      %19llu  %19llu  %19llu  %19llu\n", clnt_rply->stats.if_rx_pkts[EGRESS_IF],
+                clnt_rply->stats.if_rx_pkts[EGRESS_IF+1], clnt_rply->stats.if_rx_pkts[INGRESS_IF],
+				srvr_rply->stats.if_rx_pkts[EGRESS_IF]);
+        printf("Tx Packets:      %19llu  %19llu  %19llu  %19llu\n", clnt_rply->stats.if_tx_pkts[EGRESS_IF],
+                clnt_rply->stats.if_tx_pkts[EGRESS_IF+1], clnt_rply->stats.if_tx_pkts[INGRESS_IF],
+				srvr_rply->stats.if_tx_pkts[EGRESS_IF]);
+        printf("Rx Bytes:        %19llu  %19llu  %19llu  %19llu\n", clnt_rply->stats.if_rx_bytes[EGRESS_IF],
+                clnt_rply->stats.if_rx_bytes[EGRESS_IF+1], clnt_rply->stats.if_rx_bytes[INGRESS_IF],
+				srvr_rply->stats.if_rx_bytes[EGRESS_IF]);
+        printf("Tx Bytes:        %19llu  %19llu  %19llu  %19llu\n", clnt_rply->stats.if_tx_bytes[EGRESS_IF],
+                clnt_rply->stats.if_tx_bytes[EGRESS_IF+1], clnt_rply->stats.if_tx_bytes[INGRESS_IF],
+				srvr_rply->stats.if_tx_bytes[EGRESS_IF]);
+        printf("Dropped:         %19llu  %19llu  %19llu  %19llu\n", clnt_rply->stats.if_dropped_pkts[EGRESS_IF],
+                clnt_rply->stats.if_dropped_pkts[EGRESS_IF+1], clnt_rply->stats.if_dropped_pkts[INGRESS_IF],
+				srvr_rply->stats.if_dropped_pkts[EGRESS_IF]);
+        printf("Dropped (ratio): %19llu  %19llu  %19llu  %19llu\n", clnt_rply->stats.if_dropped_pkts_ratio[EGRESS_IF],
+                clnt_rply->stats.if_dropped_pkts_ratio[EGRESS_IF+1], clnt_rply->stats.if_dropped_pkts_ratio[INGRESS_IF],
+				srvr_rply->stats.if_dropped_pkts_ratio[EGRESS_IF]);
+        printf("Dropped (v4v6):  %19llu  %19llu  %19llu  %19llu\n", clnt_rply->stats.if_dropped_pkts_v4v6[EGRESS_IF],
+                clnt_rply->stats.if_dropped_pkts_v4v6[EGRESS_IF+1], clnt_rply->stats.if_dropped_pkts_v4v6[INGRESS_IF],
+				srvr_rply->stats.if_dropped_pkts_v4v6[EGRESS_IF]);
+        printf("Dropped (qctl):  %19llu  %19llu  %19llu  %19llu\n", clnt_rply->stats.if_dropped_pkts_qcontrol[EGRESS_IF],
+                clnt_rply->stats.if_dropped_pkts_qcontrol[EGRESS_IF+1], clnt_rply->stats.if_dropped_pkts_qcontrol[INGRESS_IF],
+				srvr_rply->stats.if_dropped_pkts_qcontrol[EGRESS_IF]);
+        printf("CBUF rxq sz:               %9u            %9u            %9u            %9u\n", clnt_rply->stats.circular_buffer_rxq_sz[EGRESS_IF],
+                clnt_rply->stats.circular_buffer_rxq_sz[EGRESS_IF+1], clnt_rply->stats.circular_buffer_rxq_sz[INGRESS_IF],
+				srvr_rply->stats.circular_buffer_rxq_sz[EGRESS_IF]);
+        printf("CBUF txq sz:               %9u            %9u            %9u            %9u\n", clnt_rply->stats.circular_buffer_txq_sz[EGRESS_IF],
+                clnt_rply->stats.circular_buffer_txq_sz[EGRESS_IF+1], clnt_rply->stats.circular_buffer_txq_sz[INGRESS_IF],
+				srvr_rply->stats.circular_buffer_txq_sz[EGRESS_IF]);
+        printf("CBUF rxq freesz:           %9u            %9u            %9u            %9u\n", clnt_rply->stats.circular_buffer_rxq_freesz[EGRESS_IF],
+                clnt_rply->stats.circular_buffer_rxq_freesz[EGRESS_IF+1], clnt_rply->stats.circular_buffer_rxq_freesz[INGRESS_IF],
+				srvr_rply->stats.circular_buffer_rxq_freesz[EGRESS_IF]);
+        printf("CBUF txq freesz:           %9u            %9u            %9u            %9u\n", clnt_rply->stats.circular_buffer_rxq_freesz[EGRESS_IF],
+                clnt_rply->stats.circular_buffer_txq_freesz[EGRESS_IF+1], clnt_rply->stats.circular_buffer_txq_freesz[INGRESS_IF],
+				srvr_rply->stats.circular_buffer_rxq_freesz[EGRESS_IF]);
+        printf("CBUF rxq ovhdsz:           %9u            %9u            %9u            %9u\n", clnt_rply->stats.circular_buffer_rxq_overheadsz[EGRESS_IF],
+                clnt_rply->stats.circular_buffer_rxq_overheadsz[EGRESS_IF+1], clnt_rply->stats.circular_buffer_rxq_overheadsz[INGRESS_IF],
+				srvr_rply->stats.circular_buffer_rxq_overheadsz[EGRESS_IF]);
+        printf("CBUF txq ovhdsz:           %9u            %9u            %9u            %9u\n\n", clnt_rply->stats.circular_buffer_txq_overheadsz[EGRESS_IF],
+                clnt_rply->stats.circular_buffer_txq_overheadsz[EGRESS_IF+1], clnt_rply->stats.circular_buffer_txq_overheadsz[INGRESS_IF],
+				srvr_rply->stats.circular_buffer_txq_overheadsz[EGRESS_IF]);
+        printf("Client Reorders: %19llu  Reorder Failures: %19llu\n", clnt_rply->stats.reorders,
+                clnt_rply->stats.reorder_failures);
+        printf("Server Reorders: %19llu  Reorder Failures: %19llu\n", srvr_rply->stats.reorders,
+        		srvr_rply->stats.reorder_failures);
+        printf("Client Mempool total sz: %9u  free sz: %9u  overhead sz: %9u\n", clnt_rply->stats.mempool_totalsz,
+                clnt_rply->stats.mempool_freesz, clnt_rply->stats.mempool_overheadsz);
+        printf("Server Mempool total sz: %9u  free sz: %9u  overhead sz: %9u\n", srvr_rply->stats.mempool_totalsz,
+        		srvr_rply->stats.mempool_freesz, srvr_rply->stats.mempool_overheadsz);
     } else {
-        printf("             %19s\n", rply->stats.if_name[EGRESS_IF]);
-        printf("Rx Packets:  %19llu\n", rply->stats.if_rx_pkts[EGRESS_IF]);
-        printf("Tx Packets:  %19llu\n", rply->stats.if_tx_pkts[EGRESS_IF]);
-        printf("Rx Bytes:    %19llu\n", rply->stats.if_rx_bytes[EGRESS_IF]);
-        printf("Tx Bytes:    %19llu\n", rply->stats.if_tx_bytes[EGRESS_IF]);
-        printf("Dropped:     %19llu\n", rply->stats.if_dropped_pkts[EGRESS_IF]);
-        printf("CBUF rxq sz:           %9u\n", rply->stats.circular_buffer_rxq_sz[EGRESS_IF]);
-        printf("CBUF txq sz:           %9u\n", rply->stats.circular_buffer_txq_sz[EGRESS_IF]);
-        printf("CBUF rxq freesz:       %9u\n", rply->stats.circular_buffer_rxq_freesz[EGRESS_IF]);
-        printf("CBUF txq freesz:       %9u\n", rply->stats.circular_buffer_txq_freesz[EGRESS_IF]);
-        printf("CBUF rxq ovhdsz:       %9u\n", rply->stats.circular_buffer_rxq_overheadsz[EGRESS_IF]);
-        printf("CBUF txq ovhdsz:       %9u\n\n", rply->stats.circular_buffer_txq_overheadsz[EGRESS_IF]);
-        printf("Reorders: %19llu  Reorder Failures: %19llu\n", rply->stats.reorders,
-                rply->stats.reorder_failures);
-        printf("Mempool total sz: %9u  free sz: %9u  overhead sz: %9u\n", rply->stats.mempool_totalsz,
-                rply->stats.mempool_freesz, rply->stats.mempool_overheadsz);
-        if (rply->stats.client_connected) {
-            if (ipv6_mode) {
-                addr6 = (struct sockaddr_in6 *) &rply->stats.client_sa[0];
-                inet_ntop(AF_INET6, &addr6->sin6_addr, client_ip_str[0], INET6_ADDRSTRLEN);
-                addr6 = (struct sockaddr_in6 *) &rply->stats.client_sa[EGRESS_IF+1];
-                inet_ntop(AF_INET6, &addr6->sin6_addr, client_ip_str[EGRESS_IF+1], INET6_ADDRSTRLEN);
-            } else {
-                addr4 = (struct sockaddr_in *) &rply->stats.client_sa[0];
-                inet_ntop(AF_INET, &addr4->sin_addr, client_ip_str[0], INET_ADDRSTRLEN);
-                addr4 = (struct sockaddr_in *) &rply->stats.client_sa[EGRESS_IF+1];
-                inet_ntop(AF_INET, &addr4->sin_addr, client_ip_str[EGRESS_IF+1], INET_ADDRSTRLEN);
-            }
-            printf("Client is connected on %s and %s.\n", client_ip_str[0], client_ip_str[1]);
-        } else {
-            printf("Client is not connected.\n");
-        }
+        printf("                 %19s  %19s\n", clnt_rply->stats.if_name[EGRESS_IF],
+				srvr_rply->stats.if_name[EGRESS_IF]);
+        printf("Rx Packets:      %19llu  %19llu\n", clnt_rply->stats.if_rx_pkts[EGRESS_IF],
+				srvr_rply->stats.if_rx_pkts[EGRESS_IF]);
+        printf("Tx Packets:      %19llu  %19llu\n", clnt_rply->stats.if_tx_pkts[EGRESS_IF],
+				srvr_rply->stats.if_tx_pkts[EGRESS_IF]);
+        printf("Rx Bytes:        %19llu  %19llu\n", clnt_rply->stats.if_rx_bytes[EGRESS_IF],
+				srvr_rply->stats.if_rx_bytes[EGRESS_IF]);
+        printf("Tx Bytes:        %19llu  %19llu\n", clnt_rply->stats.if_tx_bytes[EGRESS_IF],
+				srvr_rply->stats.if_tx_bytes[EGRESS_IF]);
+        printf("Dropped:         %19llu  %19llu\n", clnt_rply->stats.if_dropped_pkts[EGRESS_IF],
+				srvr_rply->stats.if_dropped_pkts[EGRESS_IF]);
+        printf("Dropped (ratio): %19llu  %19llu\n", clnt_rply->stats.if_dropped_pkts_ratio[EGRESS_IF],
+				srvr_rply->stats.if_dropped_pkts_ratio[EGRESS_IF]);
+        printf("Dropped (v4v6):  %19llu  %19llu\n", clnt_rply->stats.if_dropped_pkts_v4v6[EGRESS_IF],
+				srvr_rply->stats.if_dropped_pkts_v4v6[EGRESS_IF]);
+        printf("Dropped (qctl):  %19llu  %19llu\n", clnt_rply->stats.if_dropped_pkts_qcontrol[EGRESS_IF],
+				srvr_rply->stats.if_dropped_pkts_qcontrol[EGRESS_IF]);
+        printf("CBUF rxq sz:           %9u            %9u\n", clnt_rply->stats.circular_buffer_rxq_sz[EGRESS_IF],
+				srvr_rply->stats.circular_buffer_rxq_sz[EGRESS_IF]);
+        printf("CBUF txq sz:           %9u            %9u\n", clnt_rply->stats.circular_buffer_txq_sz[EGRESS_IF],
+				srvr_rply->stats.circular_buffer_txq_sz[EGRESS_IF]);
+        printf("CBUF rxq freesz:       %9u            %9u\n", clnt_rply->stats.circular_buffer_rxq_freesz[EGRESS_IF],
+				srvr_rply->stats.circular_buffer_rxq_freesz[EGRESS_IF]);
+        printf("CBUF txq freesz:       %9u            %9u\n", clnt_rply->stats.circular_buffer_txq_freesz[EGRESS_IF],
+				srvr_rply->stats.circular_buffer_txq_freesz[EGRESS_IF]);
+        printf("CBUF rxq ovhdsz:       %9u            %9u\n", clnt_rply->stats.circular_buffer_rxq_overheadsz[EGRESS_IF],
+				srvr_rply->stats.circular_buffer_rxq_overheadsz[EGRESS_IF]);
+        printf("CBUF txq ovhdsz:       %9u            %9u\n\n", clnt_rply->stats.circular_buffer_txq_overheadsz[EGRESS_IF],
+				srvr_rply->stats.circular_buffer_txq_overheadsz[EGRESS_IF]);
+        printf("Client Reorders: %19llu  Reorder Failures: %19llu\n", clnt_rply->stats.reorders,
+                clnt_rply->stats.reorder_failures);
+        printf("Server Reorders: %19llu  Reorder Failures: %19llu\n", srvr_rply->stats.reorders,
+        		srvr_rply->stats.reorder_failures);
+        printf("Client Mempool total sz: %9u  free sz: %9u  overhead sz: %9u\n", clnt_rply->stats.mempool_totalsz,
+                clnt_rply->stats.mempool_freesz, clnt_rply->stats.mempool_overheadsz);
+        printf("Server Mempool total sz: %9u  free sz: %9u  overhead sz: %9u\n", srvr_rply->stats.mempool_totalsz,
+        		srvr_rply->stats.mempool_freesz, srvr_rply->stats.mempool_overheadsz);
     }
+	if (srvr_rply->stats.client_connected) {
+		if (ipv6_mode) {
+			addr6 = (struct sockaddr_in6 *) &srvr_rply->stats.client_sa[0];
+			inet_ntop(AF_INET6, &addr6->sin6_addr, client_ip_str[0], INET6_ADDRSTRLEN);
+			addr6 = (struct sockaddr_in6 *) &srvr_rply->stats.client_sa[EGRESS_IF+1];
+			inet_ntop(AF_INET6, &addr6->sin6_addr, client_ip_str[EGRESS_IF+1], INET6_ADDRSTRLEN);
+		} else {
+			addr4 = (struct sockaddr_in *) &srvr_rply->stats.client_sa[0];
+			inet_ntop(AF_INET, &addr4->sin_addr, client_ip_str[0], INET_ADDRSTRLEN);
+			addr4 = (struct sockaddr_in *) &srvr_rply->stats.client_sa[EGRESS_IF+1];
+			inet_ntop(AF_INET, &addr4->sin_addr, client_ip_str[EGRESS_IF+1], INET_ADDRSTRLEN);
+		}
+		printf("Client is connected to server on %s and %s.\n", client_ip_str[0], client_ip_str[1]);
+	} else {
+		printf("Client is not connected to server.\n");
+	}
     printf("\n\n");
 }
 
@@ -281,9 +328,6 @@ static void print_all_stats(unsigned int iter)
             }
             bytecnt += rc;
         } while (bytecnt < sizeof(struct comms_reply_s));
-        printf("%s%s", clr, topLeft); // Clear screen and move to top left
-        if (clntrply.rc == 0) print_stats(&clntrply, "Local");
-        else printf("Error retrieving stats, rc=%d.\n", clntrply.rc);
         bytecnt = 0;
         do {
             if ((rc = send(comms_serv_fd, &srvrqry_c[bytecnt], sizeof(struct comms_query_s)-bytecnt, 0)) == -1) {
@@ -300,8 +344,9 @@ static void print_all_stats(unsigned int iter)
             }
             bytecnt += rc;
         } while (bytecnt < sizeof(struct comms_reply_s));
-        if (srvrrply.rc == 0) print_stats(&srvrrply, "Remote");
-        else printf("Error retrieving remote stats, rc=%d.\n", srvrrply.rc);
+        printf("%s%s", clr, topLeft); // Clear screen and move to top left
+        if (clntrply.rc == 0 && srvrrply.rc == 0) print_stats(&clntrply, &srvrrply);
+        else printf("Error retrieving stats, rc=%d.\n", clntrply.rc);
         timeout.tv_sec      = print_stats_delay;
         timeout.tv_usec     = 0;
         FD_ZERO(&set);
