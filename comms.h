@@ -29,38 +29,30 @@
 extern "C" {
 #endif
 
-#define NUM_EGRESS_INTERFACES   2
-#define NUM_INGRESS_INTERFACES  1
-#define PORT 			1058
+#define NUM_NETFILTER_QUEUES	2
+#define NUM_EGRESS_INTERFACES	2
+#define PORT 					1058
 
 // Comms commands
 #define COMMS_HELO              0
 #define COMMS_GETSTATS          1
+#define COMMS_CYA				2
+#define COMMS_REPLY				3
 #define COMMS_SET_QCONTROL      4
-#define COMMS_KILL              6
-#define COMMS_EXIT              7
+#define COMMS_KILL              5
+#define COMMS_EXIT              6
 
-#pragma pack(1)    
+#pragma pack(1)
 struct statistics_s {
-    char                    if_name[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES][IFNAMSIZ+1];
-    unsigned long long      if_rx_pkts[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned long long      if_tx_pkts[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned long long      if_rx_bytes[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned long long      if_tx_bytes[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned long long      if_dropped_pkts_ratio[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned long long      if_dropped_pkts_v4v6[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned long long      if_dropped_pkts_qcontrol[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned long long      if_dropped_pkts[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned int            mempool_totalsz;
-    unsigned int            mempool_freesz;
-    unsigned int            mempool_overheadsz;
-    unsigned int            circular_buffer_rxq_sz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned int            circular_buffer_rxq_freesz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned int            circular_buffer_rxq_overheadsz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned int            circular_buffer_txq_sz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned int            circular_buffer_txq_freesz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned int            circular_buffer_txq_overheadsz[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-    unsigned int            num_interfaces;
+    unsigned long long      nf_rx_pkts[NUM_NETFILTER_QUEUES];
+    unsigned long long      nf_tx_pkts[NUM_NETFILTER_QUEUES];
+    unsigned long long      nf_rx_bytes[NUM_NETFILTER_QUEUES];
+    unsigned long long      nf_tx_bytes[NUM_NETFILTER_QUEUES];
+    unsigned long long      nf_dropped_pkts_ratio[NUM_NETFILTER_QUEUES];
+    unsigned long long      nf_dropped_pkts_proto[NUM_NETFILTER_QUEUES];
+    unsigned long long      nf_dropped_pkts_qcontrol[NUM_NETFILTER_QUEUES];
+    unsigned long long      nf_dropped_pkts_space[NUM_NETFILTER_QUEUES];
+    unsigned long long      nf_dropped_pkts[NUM_NETFILTER_QUEUES];
     unsigned long long      reorders;
     unsigned long long      reorder_failures;
     struct sockaddr_storage client_sa[2];
@@ -76,7 +68,6 @@ struct comms_helo_data_s {
 };
 
 struct comms_query_s {
-    unsigned int                cmd;
     bool                        for_peer;
     struct comms_helo_data_s    helo_data;
     unsigned int                num_thread;
@@ -85,12 +76,21 @@ struct comms_query_s {
 };
 
 struct comms_reply_s {
+    unsigned int		qcmd;
     int                 rc;
     struct statistics_s stats;
     char                thread_names[8][17];
     bool                thread_status[8];
     unsigned int        num_threads;
     bool                is_client;
+};
+
+struct comms_packet_s {
+    unsigned int        cmd;
+    union {
+    	struct comms_query_s	qry;
+    	struct comms_reply_s	rply;
+    } pyld;
 };
 #pragma pack()
 

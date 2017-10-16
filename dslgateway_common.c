@@ -47,6 +47,7 @@
 #include <linux/if_tun.h>
 #include <linux/sockios.h>
 #include <linux/limits.h>
+#include <linux/netfilter.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -62,39 +63,36 @@
 #include <netinet/ip6.h>
 #include <ifaddrs.h>
 #include <libconfig.h>
+#include <libnetfilter_queue/libnetfilter_queue.h>
 
-#include "circular_buffer.h"
 #include "log.h"
 #include "comms.h"
 #include "util.h"
 #include "dslgateway.h"
 
 char                        *progname;
-struct if_config_s          if_config[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-unsigned int                egresscnt=0, ingresscnt=0;
-mempool                     mPool;
+struct if_config_s          if_config[NUM_EGRESS_INTERFACES];
+unsigned int                egresscnt=0;
 bool                        wipebufs=false;
-int                         comms_peer_fd=-1;
-struct statistics_s         if_stats;
-unsigned int                cc_port=PORT;
-struct thread_list_s        dsl_threads[((NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES)*2)+2];
+struct statistics_s         nf_stats;
 int                         thread_exit_rc;
-unsigned int                n_mbufs=DEFAULT_NUM_MBUFS;
 bool                        ipv6_mode=false;
-bool                        q_control_on=false;
+struct nf_queue_config_s    nfq_config[NUM_NETFILTER_QUEUES];
+int                         comms_peer_fd=-1;
 bool                        comms_addr_valid=false;
-char                        *comms_name=NULL;
-
-static struct sockaddr_in6          comms_addr6;
-static struct sockaddr_in           comms_addr;
-
-
+void                        (*exit_level2_cleanup)(void) = NULL;
+void                      	(*handle_comms_command)(struct comms_packet_s *query, struct comms_packet_s *reply,
+        						int comms_client_fd, bool *connection_active) = NULL;
 
 // +----------------------------------------------------------------------------
-// | Do some more cleanup
+// | Do some cleanup
 // +----------------------------------------------------------------------------
 void exit_level1_cleanup(void)
 {
+    if (nfq_config[INGRESS_NFQ].qh != NULL) nfq_destroy_queue(nfq_config[INGRESS_NFQ].qh);
+    if (nfq_config[EGRESS_NFQ].qh != NULL) nfq_destroy_queue(nfq_config[EGRESS_NFQ].qh);
+    if (nfq_config[INGRESS_NFQ].h != NULL) nfq_close(nfq_config[INGRESS_NFQ].h);
+    if (exit_level2_cleanup) exit_level2_cleanup();
     log_msg(LOG_INFO, "%s daemon ends.\n", progname);
 }
 
@@ -117,128 +115,142 @@ void signal_handler(int sig)
 }
 
 
+//// +----------------------------------------------------------------------------
+//// | Transmit thread, one is started on each interface, three on the home gateway
+//// | one on the vps. Note that, unlike the rx interfaces on the home gateway,
+//// | each tx interface has it's own circular buffer.
+//// +----------------------------------------------------------------------------
+//void *tx_thread(void * arg)
+//{
+//    struct if_queue_s   *txq = (struct if_queue_s *) arg;
+//    struct mbuf_s       *mbuf=NULL;
+//    unsigned char       *mbufc;
+//    ssize_t             txSz;
+//    struct ip6_hdr      *ip6hdr;
+//    struct ip           *iphdr;
+//
+//    while (txq->if_thread->keep_going) {
+//        while ((sem_wait(&txq->if_ready) == -1) && (errno == EINTR));
+//        if ((mbuf = (struct mbuf_s*) circular_buffer_pop(txq->if_pkts)) == NULL) continue;
+//        mbufc   = (unsigned char *) mbuf;
+//        if (mbuf->ipv6) {
+//            ip6hdr   = (struct ip6_hdr *) (mbufc + sizeof (struct ether_header));
+//            // TODO: deal with partial packet send
+//            while (((txSz = write(if_config[txq->if_index].if_tx_fd, (const void *) mbuf, ip6hdr->ip6_plen+sizeof(struct ip6_hdr))) == -1) && (errno==EINTR));
+//        } else {
+//            iphdr   = (struct ip *) (mbufc + sizeof(struct ether_header));
+//            // TODO: deal with partial packet send
+//            while (((txSz = write(if_config[txq->if_index].if_tx_fd, (const void *) mbuf, iphdr->ip_len+sizeof(struct ip))) == -1) && (errno==EINTR));
+//        }
+//        if (txSz == -1) {
+//            log_msg(LOG_ERR, "%s-%d: Error sending ip packet on interface %s - %s.\n",
+//                    __FUNCTION__, __LINE__, if_config[txq->if_index].if_txname, strerror(errno));
+//        }
+//        mempool_free(mPool, mbuf, wipebufs);
+//        if_stats.if_tx_pkts[txq->if_index]++;
+//        if_stats.if_tx_bytes[txq->if_index] += txSz;
+//    }
+//
+//    thread_exit_rc = 0;
+//    pthread_exit(&thread_exit_rc);
+//    return &thread_exit_rc;  // for compiler warnings
+//}
+
+
 // +----------------------------------------------------------------------------
-// | Transmit thread, one is started on each interface, three on the home gateway
-// | one on the vps. Note that, unlike the rx interfaces on the home gateway,
-// | each tx interface has it's own circular buffer.
+// | Send comms packets and account for partial sends
 // +----------------------------------------------------------------------------
-void *tx_thread(void * arg)
+int send_comms_pkt(int fd, const void *buf, size_t len)
 {
-    struct if_queue_s   *txq = (struct if_queue_s *) arg;
-    struct mbuf_s       *mbuf=NULL;
-    unsigned char       *mbufc;
-    ssize_t             txSz;
-    struct ip6_hdr      *ip6hdr;
-    struct ip           *iphdr;
+    int             rc, bytecnt;
+    uint8_t			*bufc = (uint8_t *) buf;
 
-    while (txq->if_thread->keep_going) {
-        while ((sem_wait(&txq->if_ready) == -1) && (errno == EINTR));
-        if ((mbuf = (struct mbuf_s*) circular_buffer_pop(txq->if_pkts)) == NULL) continue;
-        mbufc   = (unsigned char *) mbuf;
-        if (mbuf->ipv6) {
-            ip6hdr   = (struct ip6_hdr *) (mbufc + sizeof (struct ether_header));
-            // TODO: deal with partial packet send
-            while (((txSz = write(if_config[txq->if_index].if_tx_fd, (const void *) mbuf, ip6hdr->ip6_plen+sizeof(struct ip6_hdr))) == -1) && (errno==EINTR));
-        } else {
-            iphdr   = (struct ip *) (mbufc + sizeof(struct ether_header));
-            // TODO: deal with partial packet send
-            while (((txSz = write(if_config[txq->if_index].if_tx_fd, (const void *) mbuf, iphdr->ip_len+sizeof(struct ip))) == -1) && (errno==EINTR));
-        }
-        if (txSz == -1) {
-            log_msg(LOG_ERR, "%s-%d: Error sending ip packet on interface %s - %s.\n",
-                    __FUNCTION__, __LINE__, if_config[txq->if_index].if_txname, strerror(errno));
-        }
-        mempool_free(mPool, mbuf, wipebufs);
-        if_stats.if_tx_pkts[txq->if_index]++;
-        if_stats.if_tx_bytes[txq->if_index] += txSz;
-    }
-
-    thread_exit_rc = 0;
-    pthread_exit(&thread_exit_rc);
-    return &thread_exit_rc;  // for compiler warnings
+    bytecnt = 0;
+    do {
+        if ((rc = send(fd, &bufc[bytecnt], len-bytecnt, 0)) == -1) {
+        	rc = -1*errno;
+            log_msg(LOG_ERR, "%s-%d: Error sending comms packet to remote peer - %s", __FUNCTION__, __LINE__, strerror(errno));
+            return rc;
+        } else if (rc == 0) return rc;
+        bytecnt += rc;
+    } while (bytecnt < len);
 }
 
 
 // +----------------------------------------------------------------------------
-// | Connect to the server on the comms port
+// | Receive comms packets and account for partial receives
 // +----------------------------------------------------------------------------
-int reconnect_comms_to_server(void)
+int recv_comms_pkt(int fd, void *buf, size_t len)
 {
-    int             rc;
+    int             rc, bytecnt;
+    uint8_t			*bufc = (uint8_t *) buf;
 
-    log_debug_msg(LOG_INFO, "%s-%d\n", __FUNCTION__, __LINE__);
-    if (comms_peer_fd > -1) close(comms_peer_fd);
+    bytecnt = 0;
+    do {
+        if ((rc = recv(fd, &bufc[bytecnt], len-bytecnt, 0)) == -1) {
+        	rc = -1*errno;
+            log_msg(LOG_ERR, "%s-%d: Error receiving comms packet from remote peer - %s", __FUNCTION__, __LINE__, strerror(errno));
+            return rc;
+        } else if (rc == 0) return rc;
+        bytecnt += rc;
+    } while (bytecnt < len);
+}
 
-    // Convert server name to server ip address
-    if (ipv6_mode) {
-    } else {
-    }
-    if (ipv6_mode) {
-        if ((name_to_ip(comms_name, (struct sockaddr_storage *) &comms_addr6, AF_INET6)) != 0)
-        {
-            log_msg(LOG_ERR, "%s-%d: Could not translate hostname %s into ip address.\n", __FUNCTION__, __LINE__, comms_name);
-            exit_level1_cleanup();
-            exit(EINVAL);
-        }
-        if ((comms_peer_fd = socket(AF_INET6, SOCK_STREAM, 0)) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not create comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-        comms_addr6.sin6_port       = htons((unsigned short)cc_port);
-    } else {
-        if ((name_to_ip(comms_name, (struct sockaddr_storage *) &comms_addr, AF_INET)) != 0)
-        {
-            log_msg(LOG_ERR, "%s-%d: Could not translate hostname %s into ip address.\n", __FUNCTION__, __LINE__, comms_name);
-            exit_level1_cleanup();
-            exit(EINVAL);
-        }
-        if ((comms_peer_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not create comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-        comms_addr.sin_port        = htons((unsigned short)cc_port);
-    }
-    log_msg(LOG_INFO, "Waiting for connection to server %s on port %u...", comms_name, cc_port);
-    if (ipv6_mode) {
-        if (connect(comms_peer_fd, (struct sockaddr *) &comms_addr6, sizeof(comms_addr6)) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Not connected - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-    } else {
-        if (connect(comms_peer_fd, (struct sockaddr *) &comms_addr, sizeof(comms_addr)) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Not connected - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-    }
-    log_msg(LOG_INFO, "Connected.\n");
 
-    comms_addr_valid = true;
-    return 0;
+// +----------------------------------------------------------------------------
+// | Handle a query on the comms socket
+// +----------------------------------------------------------------------------
+static void handle_comms_query(struct comms_packet_s *query, int comms_client_fd, bool *connection_active)
+{
+    int                     rc;
+    struct comms_packet_s   reply;
+
+    memset(&reply, 0, sizeof(reply));
+    reply.cmd				= COMMS_REPLY;
+    reply.pyld.rply.qcmd	= query->cmd;
+    if (query->pyld.qry.for_peer) {
+        if (comms_addr_valid) {
+            query->pyld.qry.for_peer = false;
+            if ((rc = send_comms_pkt(comms_peer_fd, query, sizeof(struct comms_packet_s))) < 0) {
+            	reply.pyld.rply.rc = -1*rc;
+                send_comms_pkt(comms_client_fd, &reply, sizeof(struct comms_packet_s));
+                return;
+            }
+        } else {
+            reply.pyld.rply.rc = EHOSTUNREACH;
+        }
+    } else if (handle_comms_command) {
+    	handle_comms_command(query, &reply, comms_client_fd, connection_active);
+    } else {
+        reply.pyld.rply.rc = EFAULT;
+    }
+
+    if ((rc = send_comms_pkt(comms_client_fd, &reply, sizeof(struct comms_packet_s))) < 0) {
+    	reply.pyld.rply.rc = -1*rc;
+        send_comms_pkt(comms_client_fd, &reply, sizeof(struct comms_packet_s));
+        return;
+    }
 }
 
 
 // +----------------------------------------------------------------------------
 // | Thread to handle communication channel, one spawned for each connection
 // +----------------------------------------------------------------------------
-static void *comms_thread(void *arg)
+void *comms_thread(void *arg)
 {
     struct comms_thread_parms_s *thread_parms  = (struct comms_thread_parms_s *) arg;
     bool                        connection_active;
-    struct comms_query_s        client_query;
+    struct comms_packet_s       pkt;
     int                         rc;
 
     connection_active = true;
     while(connection_active) {
-        if ((rc = recv(thread_parms->peer_fd, &client_query, sizeof(struct comms_query_s), 0)) > 0) {
-            handle_client_query(&client_query, thread_parms->peer_fd, &connection_active);
+        if ((rc = recv_comms_pkt(thread_parms->peer_fd, &pkt, sizeof(struct comms_packet_s))) > 0) {
+        	if (pkt.cmd == COMMS_REPLY) {
+
+        	} else {
+                handle_comms_query(&pkt, thread_parms->peer_fd, &connection_active);
+        	}
         } else if (rc == 0) {
             connection_active = false;
         } else if (errno == EINTR) {
@@ -247,234 +259,16 @@ static void *comms_thread(void *arg)
             log_msg(LOG_WARNING, "%s-%d: Error receiving comms message from client - %s", __FUNCTION__, __LINE__, strerror(errno));
         }
     }
+    if (thread_parms->peer_fd == comms_peer_fd) {
+        comms_peer_fd       = -1;
+        comms_addr_valid    = false;
+    }
     close(thread_parms->peer_fd);
     free(thread_parms);
     pthread_exit(NULL);
     return NULL; // for compiler warnings
 }
 
-
-// +----------------------------------------------------------------------------
-// | Create comms channel
-// +----------------------------------------------------------------------------
-static void create_comms_channel(unsigned int port, int *commsfd)
-{
-    int                         rc;
-    struct sockaddr_in6         bind_addr6;
-    struct sockaddr_in          bind_addr;
-
-    bzero((char *) &bind_addr, sizeof(bind_addr));
-    bzero((char *) &bind_addr6, sizeof(bind_addr6));
-    if (ipv6_mode) {
-        if ((*commsfd = socket(AF_INET6, SOCK_STREAM, 0)) == -1) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Error creating comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-        bind_addr6.sin6_family   = AF_INET6;
-        bind_addr6.sin6_addr     = in6addr_any;
-        bind_addr6.sin6_port     = htons((unsigned short)port);
-    } else {
-        if ((*commsfd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Error creating comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
-            close(*commsfd);
-            exit_level1_cleanup();
-            exit(rc);
-        }
-        bind_addr.sin_family        = AF_INET;
-        bind_addr.sin_addr.s_addr   = htonl(INADDR_ANY);
-        bind_addr.sin_port          = htons((unsigned short)port);
-    }
-    if (setsockopt(*commsfd, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int)) == -1) {
-        log_msg(LOG_WARNING, "%s-%d: Error setting reuse address on comms socket.\n", __FUNCTION__, __LINE__);
-    }
-    if (ipv6_mode) {
-        if (bind(*commsfd, (struct sockaddr *) &bind_addr6, sizeof(bind_addr6)) == -1) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not bind comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
-            close(*commsfd);
-            exit_level1_cleanup();
-            exit(rc);
-        }
-    } else {
-        if (bind(*commsfd, (struct sockaddr *) &bind_addr, sizeof(bind_addr)) == -1) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not bind comms socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
-            close(*commsfd);
-            exit_level1_cleanup();
-            exit(rc);
-        }
-    }
-
-    if (listen(*commsfd, 5) == -1) {
-        rc = errno;
-        log_msg(LOG_ERR, "%s-%d: Can not listen on comms socket - %s.\n", __FUNCTION__, __LINE__, rc);
-        close(*commsfd);
-        exit_level1_cleanup();
-        exit(rc);
-    }
-}
-
-
-// +----------------------------------------------------------------------------
-// | Thread to handle remote communication channel
-// +----------------------------------------------------------------------------
-static void *accept_comms_thread(void *arg)
-{
-    struct comms_thread_parms_s *thread_parms  = (struct comms_thread_parms_s *) arg;
-    int                         comms_client_fd;
-    char                        ipaddr[INET6_ADDRSTRLEN];
-    struct comms_thread_parms_s *comms_thread_parms;
-    socklen_t                   sin_size;
-    int                         rc;
-    struct sockaddr_in6         comms_client_addr6;
-    struct sockaddr_in          comms_client_addr;
-
-    for(;;) {
-        if (ipv6_mode) {
-            if ((comms_client_fd = accept(thread_parms->peer_fd, (struct sockaddr *)&comms_client_addr6, &sin_size)) < 0) {
-                log_msg(LOG_ERR, "%s-%d: Error accepting comms connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-                continue;
-            }
-            inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&comms_client_addr6), ipaddr, sizeof ipaddr);
-        } else {
-            if ((comms_client_fd = accept(thread_parms->peer_fd, (struct sockaddr *)&comms_client_addr, &sin_size)) < 0) {
-                log_msg(LOG_ERR, "%s-%d: Error accepting comms connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-                continue;
-            }
-            inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&comms_client_addr), ipaddr, sizeof ipaddr);
-        }
-        log_msg(LOG_INFO, "Accepted connection from %s.\n", ipaddr);
-        if ((comms_thread_parms = (struct comms_thread_parms_s *) malloc(sizeof(struct comms_thread_parms_s))) == NULL) {
-            log_msg(LOG_ERR, "%s-%d: Out of memory.\n", __FUNCTION__, __LINE__);
-            close(comms_client_fd);
-            continue;
-        }
-        comms_thread_parms->peer_fd = comms_client_fd;
-        if ((rc = create_thread(&comms_thread_parms->thread_id, comms_thread, 1, "comms_thread", (void *) comms_thread_parms)) != 0) {
-            log_msg(LOG_ERR, "%s-%d: Can not create comms thread for connection from %s - %s.\n", __FUNCTION__, __LINE__, ipaddr, strerror(rc));
-        }
-    }
-    pthread_exit(NULL);
-    return NULL; // for compiler warnings
-}
-
-
-// +----------------------------------------------------------------------------
-// | Open egress interfaces, allocate rx and tx circular buffers for egress
-// | interfaces. Note there are two egress interfaces on the home gateway, and
-// | one on the vps
-// +----------------------------------------------------------------------------
-void open_egress_interfaces(void)
-{
-    int             i, rc;
-    struct ifreq    ifr;
-
-    for (i=0; i<egresscnt; i++) {
-        // Open raw socket for egress tx interface, opened in IP mode so we don't have to
-        // provide the ethernet header.
-        if ((if_config[i].if_tx_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not create socket for egress interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-        memset(&ifr, 0, sizeof(ifr));
-        strncpy(ifr.ifr_name, if_config[i].if_txname, sizeof(ifr.ifr_name));
-        // Get interface if index
-        if (ioctl (if_config[i].if_tx_fd, SIOCGIFINDEX, &ifr) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not get interface index for %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-        // Set flag that indicates we will be providing IP header
-        if (setsockopt (if_config[i].if_tx_fd, IPPROTO_IP, IP_HDRINCL, &(int){ 1 }, sizeof(int)) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not set IP_HDRINCL socket option for %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-        // Bind raw socket to a particular interface name (eg: ppp0 or ppp1)
-        if (setsockopt(if_config[i].if_tx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not bind socket to %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-        log_debug_msg(LOG_INFO, "%s-%d: Interface %d tx bound to %s.\n", __FUNCTION__, __LINE__, i, ifr.ifr_name);
-        // Open egress rx socket interface, this socket is opened such that we get the ethernet
-        // header as well as the ip header
-        if ((if_config[i].if_rx_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not create socket for egress rx interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-        memset(&ifr, 0, sizeof(ifr));
-        strncpy(ifr.ifr_name, if_config[i].if_rxname, sizeof(ifr.ifr_name));
-        // Get interface if index
-        if (ioctl (if_config[i].if_rx_fd, SIOCGIFINDEX, &ifr) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not get interface index for %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-        // Bind raw socket to a particular interface name (eg: ppp0 or ppp1)
-        if (setsockopt(if_config[i].if_rx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not bind socket to %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-        log_debug_msg(LOG_INFO, "%s-%d: Interface %d rx bound to %s.\n", __FUNCTION__, __LINE__, i, ifr.ifr_name);
-        // Setup the rx queue
-        if_config[i].if_rxq.if_index  = i;
-        if_config[i].if_rxq.if_thread = &dsl_threads[i*2];
-        if (i == EGRESS_IF) {
-            // Only create one circular buffer and semaphore for both rx queues
-            if ((if_config[i].if_rxq.if_pkts = circular_buffer_create(n_mbufs/(ingresscnt+egresscnt), mPool)) == CIRCULAR_BUFFER_INVALID) {
-                log_msg(LOG_ERR, "%s-%d: Failure to create rx circular buffer for index %d.\n", __FUNCTION__, __LINE__, i);
-                exit_level1_cleanup();
-                exit(ENOMEM);
-            }
-            if (sem_init(&if_config[i].if_rxq.if_ready, 0, 0) == -1) {
-                rc = errno;
-                log_msg(LOG_ERR, "%s-%d: Failure to create rx queue semaphore for index %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
-                exit_level1_cleanup();
-                exit(rc);
-            }
-        } else {
-            if_config[i].if_rxq.if_pkts   = if_config[EGRESS_IF].if_rxq.if_pkts;
-            if_config[i].if_rxq.if_ready  = if_config[EGRESS_IF].if_rxq.if_ready;
-        }
-        if (q_control_on) {
-            if_config[i].if_rxq.q_control       = true;
-            if_config[i].if_rxq.q_control_cnt   = 0;
-        } else if_config[i].if_rxq.q_control    = false;
-        // Set up the tx queue
-        if_config[i].if_txq.if_index  = i;
-        if_config[i].if_txq.if_thread = &dsl_threads[(i*2)+1];
-        // Each tx interface has it's own circular buffer and semaphore, unlike the rx interfaces
-        if ((if_config[i].if_txq.if_pkts = circular_buffer_create(n_mbufs/(ingresscnt+egresscnt), mPool)) == CIRCULAR_BUFFER_INVALID) {
-            log_msg(LOG_ERR, "%s-%d: Failure to create tx circular buffer for index %d.\n", __FUNCTION__, __LINE__, i);
-            exit_level1_cleanup();
-            exit(ENOMEM);
-        }
-        if (sem_init(&if_config[i].if_txq.if_ready, 0, 0) == -1) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Failure to create tx queue semaphore for index %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-        if (q_control_on) {
-            if_config[i].if_txq.q_control       = true;
-            if_config[i].if_txq.q_control_cnt   = 0;
-        } else if_config[i].if_txq.q_control    = false;
-    }
-}
 
 // +----------------------------------------------------------------------------
 // | Get ip addresses of all the interfaces
@@ -498,53 +292,27 @@ void get_ip_addrs(void)
                                   (ifa_p->ifa_addr->sa_family == AF_INET6))) {
             if (ipv6_mode) {
                 if (ifa_p->ifa_addr->sa_family == AF_INET6) {
-                    for (i=0; i<egresscnt+ingresscnt; i++) {
-                        if (strcmp(if_config[i].if_txname, ifa_p->ifa_name) == 0) {
+                    for (i=0; i<egresscnt; i++) {
+                        if (strcmp(if_config[i].if_name, ifa_p->ifa_name) == 0) {
                             memcpy(&if_config[i].if_ipaddr, ifa_p->ifa_addr, sizeof(struct sockaddr_in6));
                             inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&if_config[i].if_ipaddr), ipaddr, sizeof(ipaddr));
-                            log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_config[i].if_txname, ipaddr);
+                            log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_config[i].if_name, ipaddr);
                         }
                     }
                 }
             } else {
                 if (ifa_p->ifa_addr->sa_family == AF_INET) {
-                    for (i=0; i<egresscnt+ingresscnt; i++) {
-                        if (strcmp(if_config[i].if_txname, ifa_p->ifa_name) == 0) {
+                    for (i=0; i<egresscnt; i++) {
+                        if (strcmp(if_config[i].if_name, ifa_p->ifa_name) == 0) {
                             memcpy(&if_config[i].if_ipaddr, ifa_p->ifa_addr, sizeof(struct sockaddr_in));
                             inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&if_config[i].if_ipaddr), ipaddr, sizeof(ipaddr));
-                            log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_config[i].if_txname, ipaddr);
+                            log_msg(LOG_INFO, "Interface %s has ip address %s\n", if_config[i].if_name, ipaddr);
                         }
                     }
                 }
             }
         }
         ifa_p = ifa_p->ifa_next;
-    }
-}
-
-
-// +----------------------------------------------------------------------------
-// | Process local comms port
-// +----------------------------------------------------------------------------
-void process_comms(void)
-{
-    int                         rc;
-    struct comms_thread_parms_s *comms_thread_parms;
-    int                         commsfd;
-    char                        ipaddr[INET6_ADDRSTRLEN];
-
-    // Open local communication channel
-    create_comms_channel(cc_port, &commsfd);
-
-    if ((comms_thread_parms = (struct comms_thread_parms_s *) malloc(sizeof(struct comms_thread_parms_s))) == NULL) {
-        log_msg(LOG_ERR, "%s-%d: Out of memory.\n", __FUNCTION__, __LINE__);
-        close(commsfd);
-        exit_level1_cleanup();
-        exit(ENOMEM);
-    }
-    comms_thread_parms->peer_fd = commsfd;
-    if ((rc = create_thread(&comms_thread_parms->thread_id, accept_comms_thread, 1, "comms_thread", (void *) comms_thread_parms)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create comms thread for connection from %s - %s.\n", __FUNCTION__, __LINE__, ipaddr, strerror(rc));
     }
 }
 
@@ -576,42 +344,4 @@ unsigned short iphdr_checksum(unsigned short* buff, int _16bitword)
     sum  = ((sum >> 16) + (sum & 0xFFFF));
     sum += (sum>>16);
     return (unsigned short)(~sum);
-}
-
-
-// +----------------------------------------------------------------------------
-// | Opens a tun interface. Returns fd of tun interface.
-// +----------------------------------------------------------------------------
-int tuntap_init(char *ifname)
-{
-    struct ifreq    ifr;
-    int             fd, rc;
-
-    if (ifname == NULL) return -1*EINVAL;
-
-    log_debug_msg(LOG_INFO, "%s-%d: Opening %s device.\n", __FUNCTION__, __LINE__, ifname);
-
-    if( (fd = open("/dev/net/tun" , O_RDWR)) < 0 ) {
-        log_msg(LOG_ERR, "%s-%d: Error opening /dev/net/tun - %s\n", __FUNCTION__, __LINE__, strerror(errno));
-        return -1*errno;
-    }
-
-    memset(&ifr, 0, sizeof(ifr));
-    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
-
-    if (strlen(ifname) > 0) {
-        strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
-    }
-
-    if((rc = ioctl(fd, TUNSETIFF, (void *)&ifr)) < 0) {
-        rc = -1*errno;
-        log_msg(LOG_ERR, "%s-%d: Error with ioctl(TUNSETIFF) - %s\n", __FUNCTION__, __LINE__, strerror(errno));
-        close(fd);
-        return rc;
-    }
-    if (strcmp(ifname, ifr.ifr_name) != 0)
-        strncpy(ifname, ifr.ifr_name, IFNAMSIZ);
-    log_debug_msg(LOG_INFO, "%s-%d: Opened %s device.\n", __FUNCTION__, __LINE__, ifr.ifr_name);
-
-    return fd;
 }

@@ -21,7 +21,7 @@
 // |
 // |    This file is part of a dsl gateway that splits outgoing IP traffic between
 // | two DSL lines. See dslgateway.c for an explanation of the features and intent
-// | of the program. This file implements the home gateway (client side) 
+// | of the program. This file implements the home gateway (client side)
 // | functions.
 // |
 // +----------------------------------------------------------------------------
@@ -47,6 +47,7 @@
 #include <linux/if_tun.h>
 #include <linux/sockios.h>
 #include <linux/limits.h>
+#include <linux/netfilter.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -62,6 +63,7 @@
 #include <netinet/ip6.h>
 #include <ifaddrs.h>
 #include <libconfig.h>
+#include <libnetfilter_queue/libnetfilter_queue.h>
 
 #include "circular_buffer.h"
 #include "log.h"
@@ -71,163 +73,156 @@
 
 
 extern char                     *progname;
-extern struct if_config_s       if_config[NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES];
-extern unsigned int             egresscnt, ingresscnt;
-extern struct statistics_s      if_stats;
-extern unsigned int             cc_port;
-extern  struct thread_list_s    dsl_threads[((NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES)*2)+2];
-extern mempool                  mPool;
-extern int                      comms_peer_fd;
+extern struct if_config_s       if_config[NUM_EGRESS_INTERFACES];
+extern struct nf_queue_config_s nfq_config[NUM_NETFILTER_QUEUES];
+extern unsigned int             egresscnt;
+extern struct statistics_s      nf_stats;
 extern int                      thread_exit_rc;
-extern bool                     comms_addr_valid;
-extern unsigned int             n_mbufs;
 extern bool                     ipv6_mode;
-extern bool                     q_control_on;
-extern char                     *comms_name;
+extern void                     (*exit_level2_cleanup)(void);
+extern void                     (*handle_comms_command)(struct comms_packet_s *query, struct comms_packet_s *reply,
+                                    int comms_client_fd, bool *connection_active);
 
 static bool                     is_daemon=false;
-static uint8_t                  pkt_seq_no=0;
-static unsigned int             num_threads;
-static struct mbuf_s            *reorder_buf[REORDER_BUF_SZ];
-static timer_t                  reorder_buf_timerid;
-static struct itimerspec        reorder_buf_intvl;
-static unsigned int             reorder_if_cnt[2] = {0, 0};
+//static uint8_t                  pkt_seq_no=0;
+//static struct mbuf_s            *reorder_buf[REORDER_BUF_SZ];
+//static timer_t                  reorder_buf_timerid;
+//static struct itimerspec        reorder_buf_intvl;
+//static unsigned int             reorder_if_cnt[2] = {0, 0};
 static struct sockaddr_in6      peer_addr6;
 static struct sockaddr_in       peer_addr;
 static bool                     debug=false;
 static char                     config_file_name[PATH_MAX];
 static char                     *remote_name=NULL;
+static int                      comms_peer_fd=-1;
+static unsigned int             cc_port=PORT;
+static bool                     comms_addr_valid=false;
+static char                     *comms_name=NULL;
+static bool                     q_control_on=false;
+static struct sockaddr_in6      comms_addr6;
+static struct sockaddr_in       comms_addr;
 
+
+
+//// +----------------------------------------------------------------------------
+//// | Timer thread to drain reorder buf if packets have been there too long
+//// +----------------------------------------------------------------------------
+//static void reorder_buf_timer(union sigval arg)
+//{
+//    struct timespec     ts, tsdiff;
+//    int                 i, j, k;
+//
+//    clock_gettime(CLOCK_MONOTONIC, &ts);
+//    for (i=0; i<REORDER_BUF_SZ; i++) {
+//        if (reorder_buf[i] != NULL) {
+//            tsdiff = subtract_ts(&ts, &reorder_buf[i]->rx_time);
+//            if (tsdiff.tv_sec || (tsdiff.tv_nsec > REORDER_BUF_TIMEOUT)) {
+//                circular_buffer_push(if_config[INGRESS_IF].if_txq.if_pkts, reorder_buf[i]);
+//                sem_post(&if_config[INGRESS_IF].if_txq.if_ready);
+//                pkt_seq_no = reorder_buf[i]->seq_no + 1;
+//                reorder_buf[i] = NULL;
+//            } else break;
+//        }
+//    }
+//    for (i=0; i<REORDER_BUF_SZ; i++) {
+//        if (reorder_buf[i] != NULL) {
+//            if (i != 0) {
+//                for (j=i, k=0; j<REORDER_BUF_SZ; j++, k++) {
+//                    reorder_buf[k] = reorder_buf[j];
+//                    reorder_buf[j] = NULL;
+//                }
+//                break;
+//            } else break;
+//        }
+//    }
+//}
+//
+//
+//// +----------------------------------------------------------------------------
+//// | Start the reorder buffer timeout timer.
+//// +----------------------------------------------------------------------------
+//static void arm_reorder_buf_timer(void)
+//{
+//    reorder_buf_intvl.it_value.tv_sec   = reorder_buf_intvl.it_interval.tv_sec;
+//    reorder_buf_intvl.it_value.tv_nsec  = reorder_buf_intvl.it_interval.tv_nsec;
+//    timer_settime(reorder_buf_timerid, 0, &reorder_buf_intvl, NULL);
+//}
+//
+//
+//// +----------------------------------------------------------------------------
+//// | Stop the reorder buffer timeout timer.
+//// +----------------------------------------------------------------------------
+//static void disarm_reorder_buf_timer(void)
+//{
+//    reorder_buf_intvl.it_value.tv_sec   = 0;
+//    reorder_buf_intvl.it_value.tv_nsec  = 0;
+//    timer_settime(reorder_buf_timerid, 0, &reorder_buf_intvl, NULL);
+//}
 
 
 // +----------------------------------------------------------------------------
-// | Timer thread to drain reorder buf if packets have been there too long
+// | do exit cleanup specific to the client
 // +----------------------------------------------------------------------------
-static void reorder_buf_timer(union sigval arg)
+static void client_level2_cleanup()
 {
-    struct timespec     ts, tsdiff;
-    int                 i, j, k;
+    struct comms_packet_s    cya;
 
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    for (i=0; i<REORDER_BUF_SZ; i++) {
-        if (reorder_buf[i] != NULL) {
-            tsdiff = subtract_ts(&ts, &reorder_buf[i]->rx_time);
-            if (tsdiff.tv_sec || (tsdiff.tv_nsec > REORDER_BUF_TIMEOUT)) {
-                circular_buffer_push(if_config[INGRESS_IF].if_txq.if_pkts, reorder_buf[i]);
-                sem_post(&if_config[INGRESS_IF].if_txq.if_ready);
-                pkt_seq_no = reorder_buf[i]->seq_no + 1;
-                reorder_buf[i] = NULL;
-            } else break;
-        }
+
+    // Tell server we are exiting
+    if (comms_peer_fd > 0) {
+        cya.cmd        = COMMS_CYA;
+        send(comms_peer_fd, &cya, sizeof(struct comms_query_s), 0);
     }
-    for (i=0; i<REORDER_BUF_SZ; i++) {
-        if (reorder_buf[i] != NULL) {
-            if (i != 0) {
-                for (j=i, k=0; j<REORDER_BUF_SZ; j++, k++) {
-                    reorder_buf[k] = reorder_buf[j];
-                    reorder_buf[j] = NULL;
-                }
-                break;
-            } else break;
-        }
-    }
 }
 
 
 // +----------------------------------------------------------------------------
-// | Start the reorder buffer timeout timer.
-// +----------------------------------------------------------------------------
-static void arm_reorder_buf_timer(void)
-{
-    reorder_buf_intvl.it_value.tv_sec   = reorder_buf_intvl.it_interval.tv_sec;
-    reorder_buf_intvl.it_value.tv_nsec  = reorder_buf_intvl.it_interval.tv_nsec;
-    timer_settime(reorder_buf_timerid, 0, &reorder_buf_intvl, NULL);
-}
-
-
-// +----------------------------------------------------------------------------
-// | Stop the reorder buffer timeout timer.
-// +----------------------------------------------------------------------------
-static void disarm_reorder_buf_timer(void)
-{
-    reorder_buf_intvl.it_value.tv_sec   = 0;
-    reorder_buf_intvl.it_value.tv_nsec  = 0;
-    timer_settime(reorder_buf_timerid, 0, &reorder_buf_intvl, NULL);
-}
-
-
-// +----------------------------------------------------------------------------
-// | Receive thread, one is started on each interface. Note that the rx threads 
-// | for both egress interfaces on the home gateway, feed mbufs into the same 
-// | circular buffer.
+// | Receive thread, one is started on each netfilter queue.
 // +----------------------------------------------------------------------------
 static void *rx_thread(void * arg)
 {
-    struct if_queue_s   *rxq = (struct if_queue_s *) arg;
-    struct mbuf_s       *mbuf=NULL;
-    ssize_t             rxSz;
+    struct nf_queue_config_s    *nf_config = (struct nf_queue_config_s *) arg;
+    struct mbuf_s               mbuf;
+    int                         fd;
 
-    log_debug_msg(LOG_INFO, "%s-%d: Rx thread on interface %s started.\n", __FUNCTION__, __LINE__, if_config[rxq->if_index].if_rxname);
-    while (rxq->if_thread->keep_going) {
-        if (mbuf == NULL) mbuf = (struct mbuf_s*) mempool_alloc(mPool);
-        if (mbuf == NULL) {
-            sleep(1);
-            continue;
-        }
-        // TODO: deal with partial packet receipt
-        while (((rxSz = read(if_config[rxq->if_index].if_rx_fd, (void *) mbuf, sizeof(union mbuf_u))) < 0) && (errno == EINTR));
-        if (rxSz < 0) {
-            log_msg(LOG_ERR, "%s-%d: Error reading raw packets from interface %s - %s",
-                    __FUNCTION__, __LINE__, if_config[rxq->if_index].if_rxname, strerror(errno));
-            continue;
-        }
-        mbuf->if_index = rxq->if_index;
+    if ((nf_config->qh = nfq_create_queue(nf_config->h, nf_config->nfq_q_no, nf_config->nfq_cb, NULL)) == NULL) {
+        thread_exit_rc = errno;
+        log_msg(LOG_ERR, "%s-%d: Error creating netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+        pthread_exit(&thread_exit_rc);
+    }
 
-        // ignore packets from egress interfaces with if_ratio = 0
-        if ((rxq->if_index == EGRESS_IF || rxq->if_index == EGRESS_IF+1) && if_config[rxq->if_index].if_ratio == 0) {
-            if_stats.if_dropped_pkts_ratio[rxq->if_index]++;
-            continue;
-        }
+    if (nfq_set_mode(nf_config->qh, NFQNL_COPY_PACKET, 0xffff) < 0) {
+        thread_exit_rc = errno;
+        log_msg(LOG_ERR, "%s-%d: Error setting copy mode on netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+        nfq_destroy_queue(nf_config->qh);
+        nf_config->qh = NULL;
+        pthread_exit(&thread_exit_rc);
+    }
 
-        switch (mbuf->pkt.tcp_pkt.eth_hdr.ether_type) {
-            case ETHERTYPE_IPV6:
-                if (!ipv6_mode) {
-                    // not ipv6 mode so drop the packet
-                    if_stats.if_dropped_pkts_v4v6[rxq->if_index]++;
-                    continue;
-                }
-                mbuf->ipv6 = true;
-                break;
-            case ETHERTYPE_IP:
-                if (ipv6_mode) {
-                    // not ipv4 mode so drop the packet
-                    if_stats.if_dropped_pkts_v4v6[rxq->if_index]++;
-                    continue;
-                }
-                mbuf->ipv6 = false;
-                break;
-            default:
-                if_stats.if_dropped_pkts[rxq->if_index]++;
+    fd = nfq_fd(nf_config->h);
+
+    while (nf_config->nf_thread.keep_going) {
+        while (((mbuf.len = recv(fd, &mbuf, sizeof(union mbuf_u), 0)) < 0) && (errno == EINTR));
+        if (mbuf.len < 0) {
+            if (errno == ENOBUFS) {
+                nf_stats.nf_dropped_pkts_space[nf_config->nf_index]++;
                 continue;
-        }
-        clock_gettime(CLOCK_MONOTONIC, &mbuf->rx_time);
-
-        // For debugging purposes, we have queue control that will only let a set number
-        // of packets through
-        if (rxq->q_control) {
-            if (!rxq->q_control_cnt) {
-                if_stats.if_dropped_pkts_qcontrol[rxq->if_index]++;
+            } else {
+                log_msg(LOG_ERR, "%s-%d: Error reading from netfilter queue %d - %s",
+                        __FUNCTION__, __LINE__, nf_config->nfq_q_no, strerror(errno));
                 continue;
             }
-            rxq->q_control_cnt--;
         }
+        mbuf.nfq_index = nf_config->nf_index;
 
-        // Accept the packet
-        circular_buffer_push(rxq->if_pkts, (void *) mbuf);
-        sem_post(&rxq->if_ready);
-        mbuf = NULL;
-        if_stats.if_rx_pkts[rxq->if_index]++;
-        if_stats.if_rx_bytes[rxq->if_index] += rxSz;
+        // ignore packets from egress interfaces with if_ratio = 0
+//        if ((rxq->if_index == EGRESS_IF || rxq->if_index == EGRESS_IF+1) && if_config[rxq->if_index].if_ratio == 0) {
+//            nf_stats.if_dropped_pkts_ratio[rxq->if_index]++;
+//            continue;
+//        }
+
+        clock_gettime(CLOCK_MONOTONIC, &mbuf.rx_time);
+        nfq_handle_packet(nf_config->h, (char *) &mbuf, mbuf.len);
     }
 
     thread_exit_rc = 0;
@@ -235,185 +230,218 @@ static void *rx_thread(void * arg)
     return &thread_exit_rc;   // for compiler warnings
 }
 
+
 // +----------------------------------------------------------------------------
 // | Do the packet mangling on the home gateway between the home network and the vps.
 // +----------------------------------------------------------------------------
-static void *home_to_vps_pkt_mangler_thread(void * arg)
+static int home_to_vps_pkt_mangler_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
+          struct nfq_data *nfa, void *data)
 {
-    struct mbuf_s   *mbuf;
-    uint8_t         *if_ratios;
-    unsigned char   *mbufc;
-    unsigned int    active_if = 0;
-    struct in6_addr *sv_dest_addr6;
-    struct ip6_hdr  *ip6hdr;
-    struct in_addr  *sv_dest_addr;
-    struct ip       *iphdr;
+    struct mbuf_s               *mbuf = (struct mbuf_s *) data;
+    uint8_t                     *if_ratios;
+    unsigned char               *mbufc;
+    unsigned int                active_if = 0;
+    struct in6_addr             *sv_dest_addr6;
+    struct ip6_hdr              *ip6hdr;
+    struct in_addr              *sv_dest_addr;
+    struct ip                   *iphdr;
+    uint16_t                    *dest_port, *orig_dest_port;
+    struct nfqnl_msg_packet_hdr    *ph;
+    int                            pkt_id, rc;
 
-    while (dsl_threads[HOME_TO_VPS_PKT_MANGLER_THREADNO].keep_going) {
-        sem_wait(&if_config[INGRESS_IF].if_rxq.if_ready);
-        if ((mbuf = circular_buffer_pop(if_config[INGRESS_IF].if_rxq.if_pkts)) == NULL) continue;
-        mbufc                   = (unsigned char *) mbuf;
-        // Save the destination address at the end of the packet. Also save the if_ratios
-        // in one byte at the end of the packet. Increase packet length by the length
-        // of the destination address plus 1 byte for if_ratios. Replace destination
-        // address with vps ip address, so packet will go to the vps.
-        if (mbuf->ipv6) {
-            ip6hdr                  = (struct ip6_hdr *) (mbufc + sizeof(struct ether_header));
-            sv_dest_addr6           = (struct in6_addr *) (mbufc + sizeof(struct ether_header) + sizeof(struct ip6_hdr) + ip6hdr->ip6_plen);
-            memcpy(sv_dest_addr6, &ip6hdr->ip6_dst, sizeof(struct in6_addr));
-            if_ratios               = (uint8_t *) (mbufc + sizeof(struct ether_header) + sizeof(struct ip6_hdr) + ip6hdr->ip6_plen + sizeof(struct in6_addr));
-            memcpy(&ip6hdr->ip6_dst, &peer_addr6.sin6_addr, sizeof(struct in6_addr));
-            ip6hdr->ip6_plen        = ip6hdr->ip6_plen + sizeof(struct in6_addr) + 2;
-        } else {
-            iphdr                   = (struct ip *) (mbufc + sizeof(struct ether_header));
-            sv_dest_addr            = (struct in_addr *) (mbufc + sizeof(struct ether_header) + iphdr->ip_len);
-            memcpy(sv_dest_addr, &iphdr->ip_dst, sizeof(struct in_addr));
-            if_ratios               = (uint8_t *) (mbufc + sizeof(struct ether_header) + iphdr->ip_len + sizeof(struct in_addr));
-            iphdr->ip_dst.s_addr    = peer_addr.sin_addr.s_addr;
-            iphdr->ip_len           = iphdr->ip_len + sizeof(struct in_addr) + 2;
-            iphdr->ip_sum           = iphdr_checksum((unsigned short*)(mbufc + sizeof(struct ether_header)), (sizeof(struct iphdr)/2));
+    // For debugging purposes, we have queue control that will only let a set number
+    // of packets through
+    if (nfq_config[mbuf->nfq_index].q_control) {
+        if (!nfq_config[mbuf->nfq_index].q_control_cnt) {
+            nf_stats.nf_dropped_pkts_qcontrol[mbuf->nfq_index]++;
+            return nfq_set_verdict(qh, 0, NF_DROP, 0, NULL);
         }
-        if_ratios[0]            = if_config[0].if_ratio;
-        if_ratios[1]            = if_config[1].if_ratio;
-        circular_buffer_push(if_config[active_if].if_txq.if_pkts, mbuf);
-        sem_post(&if_config[active_if].if_txq.if_ready);
-        active_if               = (active_if+1) % NUM_EGRESS_INTERFACES;
+        nfq_config[mbuf->nfq_index].q_control_cnt--;
     }
 
-    thread_exit_rc = 0;
-    pthread_exit(&thread_exit_rc);
-    return &thread_exit_rc; // for compiler warnings
+    mbufc                   = (unsigned char *) mbuf;
+    if ((ph    = nfq_get_msg_packet_hdr(nfa)) == NULL) {
+        nf_stats.nf_dropped_pkts[mbuf->nfq_index]++;
+        return nfq_set_verdict(qh, 0, NF_DROP, 0, NULL);
+    }
+    pkt_id = ntohl(ph->packet_id);
+
+    // Save the destination address at the end of the packet and replace it with the
+    // vps address. Save the destination port at the end of the packet and replace it
+    // with the vps data port. Also save the if_ratios at the end of the packet.
+    // Increase packet length by the length of the destination address plus the length
+    // of the destination port plus 2 bytes for if_ratios.
+    if (ipv6_mode) {
+        ip6hdr                  = (struct ip6_hdr *) mbufc;
+        if ((ip6hdr->ip6_nxt != IPPROTO_TCP) && (ip6hdr->ip6_nxt != IPPROTO_UDP)) {
+            nf_stats.nf_dropped_pkts_proto[mbuf->nfq_index]++;
+            return nfq_set_verdict(qh, pkt_id, NF_DROP, 0, NULL);
+        }
+        nf_stats.nf_rx_bytes[mbuf->nfq_index] += ip6hdr->ip6_plen;
+        sv_dest_addr6           = (struct in6_addr *) (mbufc + sizeof(struct ip6_hdr) + ip6hdr->ip6_plen);
+        dest_port                = (uint16_t *) (mbufc + sizeof(struct ip6_hdr)  + ip6hdr->ip6_plen + sizeof(sv_dest_addr6));
+        if_ratios               = (uint8_t *) (mbufc + sizeof(struct ip6_hdr) + ip6hdr->ip6_plen + sizeof(sv_dest_addr6) + sizeof(dest_port));
+        orig_dest_port            = (uint16_t *) (mbufc + sizeof(struct ip6_hdr) + 2);
+        memcpy(sv_dest_addr6, &ip6hdr->ip6_dst, sizeof(struct in6_addr));
+        memcpy(&ip6hdr->ip6_dst, &peer_addr6.sin6_addr, sizeof(struct in6_addr));
+        ip6hdr->ip6_plen        = ip6hdr->ip6_plen + sizeof(sv_dest_addr6) + sizeof(dest_port) + 2;
+        mbuf->len                = ip6hdr->ip6_plen;
+    } else {
+        iphdr                   = (struct ip *) mbufc;
+        if ((iphdr->ip_p != IPPROTO_TCP) && (iphdr->ip_p != IPPROTO_UDP)) {
+            nf_stats.nf_dropped_pkts_proto[mbuf->nfq_index]++;
+            return nfq_set_verdict(qh, pkt_id, NF_DROP, 0, NULL);
+        }
+        nf_stats.nf_rx_bytes[mbuf->nfq_index] += iphdr->ip_len;
+        sv_dest_addr            = (struct in_addr *) (mbufc + sizeof(struct ip) + iphdr->ip_len);
+        dest_port                = (uint16_t *) (mbufc + sizeof(struct ip)  + iphdr->ip_len + sizeof(sv_dest_addr));
+        if_ratios               = (uint8_t *) (mbufc + sizeof(struct ip) + iphdr->ip_len + sizeof(sv_dest_addr) + sizeof(dest_port));
+        orig_dest_port            = (uint16_t *) (mbufc + sizeof(struct ip) + 2);
+        memcpy(sv_dest_addr, &iphdr->ip_dst, sizeof(struct in_addr));
+        iphdr->ip_dst.s_addr    = peer_addr.sin_addr.s_addr;
+        iphdr->ip_len           = iphdr->ip_len + sizeof(sv_dest_addr) + sizeof(dest_port) + 2;
+        iphdr->ip_sum           = iphdr_checksum((unsigned short*) mbufc, (sizeof(struct iphdr)/2));
+        mbuf->len                = iphdr->ip_len;
+    }
+    if_ratios[0]            = if_config[0].if_ratio;
+    if_ratios[1]            = if_config[1].if_ratio;
+    *dest_port                = *orig_dest_port;
+    *orig_dest_port              = if_config[active_if].if_port;
+    rc                         = nfq_set_verdict2(qh, pkt_id, NF_ACCEPT, if_config[active_if].if_fwmark, mbuf->len, (char *) mbuf);
+     active_if               = (active_if+1) % NUM_EGRESS_INTERFACES;
+    nf_stats.nf_rx_pkts[mbuf->nfq_index]++;
+     return rc;
 }
 
 
-// +----------------------------------------------------------------------------
-// | Drain the reorder buf until a gap is found.
-// +----------------------------------------------------------------------------
-static void drain_reorder_buf(bool *reorder_active)
-{
-    int     i=0, j;
-
-    while ((reorder_buf[i] != NULL) && (i<REORDER_BUF_SZ)) {
-        circular_buffer_push(if_config[INGRESS_IF].if_txq.if_pkts, reorder_buf[i]);
-        sem_post(&if_config[INGRESS_IF].if_txq.if_ready);
-        pkt_seq_no++;
-        reorder_buf[i] = NULL;
-        i++;
-    }
-    *reorder_active = false;
-    reorder_if_cnt[0] = reorder_if_cnt[1] = 0;
-    if (i<REORDER_BUF_SZ) {
-        for (i=i+1, j=0; i<REORDER_BUF_SZ; i++, j++) {
-            reorder_buf[j] = reorder_buf[i];
-            if (reorder_buf[i] != NULL) {
-                *reorder_active = true;
-                reorder_if_cnt[reorder_buf[j]->if_index]++;
-            }
-            reorder_buf[i] = NULL;
-        }
-    }
-    if (!reorder_active) disarm_reorder_buf_timer();
-}
-
-
-// +----------------------------------------------------------------------------
-// | Completely drain the reorder buf.
-// +----------------------------------------------------------------------------
-static void force_drain_reorder_buf(void)
-{
-    int i;
-
-    if_config[0].if_ratio = reorder_if_cnt[0];
-    if_config[1].if_ratio = reorder_if_cnt[1];
-    for (i=0; i<REORDER_BUF_SZ; i++) {
-        if (reorder_buf[i] != NULL) {
-            circular_buffer_push(if_config[INGRESS_IF].if_txq.if_pkts, reorder_buf[i]);
-            sem_post(&if_config[INGRESS_IF].if_txq.if_ready);
-            reorder_buf[i] = NULL;
-        }
-    }
-    reorder_if_cnt[0] = reorder_if_cnt[1] = 0;
-}
-
-
-// +----------------------------------------------------------------------------
-// | Do the packet mangling on the home gateway between the vps and the home network.
-// +----------------------------------------------------------------------------
-static void *home_from_vps_pkt_mangler_thread(void * arg)
-{
-    struct mbuf_s   *mbuf;
-    uint8_t         *seq_no;
-    int             seq_diff;
-    unsigned char   *mbufc;
-    unsigned int    i;
-    bool            reorder_active=false;
-    struct in6_addr *sv_dest_addr6;
-    struct ip6_hdr  *ip6hdr;
-    struct in_addr  *sv_dest_addr;
-    struct ip       *iphdr;
-
-    for (i=0; i<REORDER_BUF_SZ; i++) reorder_buf[i] = NULL;
-    while (dsl_threads[HOME_FROM_VPS_PKT_MANGLER_THREADNO].keep_going) {
-        sem_wait(&if_config[EGRESS_IF].if_rxq.if_ready);
-        if ((mbuf = circular_buffer_pop(if_config[EGRESS_IF].if_rxq.if_pkts)) == NULL) continue;
-        mbufc                   = (unsigned char *) mbuf;
-        if (mbuf->ipv6) {
-            ip6hdr                  = (struct ip6_hdr *) (mbufc + sizeof(struct ether_header));
-            sv_dest_addr6           = (struct in6_addr *) (mbufc + sizeof(struct ether_header) + sizeof(struct ip6_hdr) + ip6hdr->ip6_plen);
-            seq_no                  = (uint8_t *) (mbufc + sizeof(struct ether_header) + sizeof(struct ip6_hdr) + ip6hdr->ip6_plen + sizeof(struct in6_addr));
-            memcpy(ip6hdr->ip6_dst.s6_addr, sv_dest_addr6, sizeof(struct in6_addr));
-            ip6hdr->ip6_plen        = ip6hdr->ip6_plen - sizeof(struct in6_addr) - 1;
-        } else {
-        iphdr                   = (struct ip *) (mbufc + sizeof(struct ether_header));
-            sv_dest_addr            = (struct in_addr *) (mbufc + sizeof(struct ether_header) + iphdr->ip_len);
-            seq_no                  = (uint8_t *) (mbufc + sizeof(struct ether_header) + iphdr->ip_len + sizeof(struct in_addr));
-            memcpy(&iphdr->ip_dst, sv_dest_addr, sizeof(struct in_addr));
-            iphdr->ip_len           = iphdr->ip_len - sizeof(struct in_addr) - 1;
-            iphdr->ip_sum           = iphdr_checksum((unsigned short*)(mbufc + sizeof(struct ether_header)), (sizeof(struct iphdr)/2));
-        }
-        seq_diff                = *seq_no - pkt_seq_no;
-        if (seq_diff < 0) seq_diff = (255 - pkt_seq_no) + *seq_no + 1;
-        if (seq_diff > 0) {
-            if (seq_diff > REORDER_BUF_SZ) {
-                // Packet we are waiting for is late, drain reorder buffer and let the tcp
-                // layer deal with it.
-                pkt_seq_no++;
-                drain_reorder_buf(&reorder_active);
-                seq_diff        = *seq_no - pkt_seq_no;
-                if (seq_diff < 0) seq_diff = (255 - pkt_seq_no) + *seq_no + 1;
-                if (seq_diff > 0) {
-                    // There are multiple packets that are late, force drain the reorder
-                    // buffer and let the tcp layer deal with it.
-                    force_drain_reorder_buf();
-                    pkt_seq_no = *seq_no;
-                    reorder_active  = false;
-                    disarm_reorder_buf_timer();
-                    if_stats.reorder_failures++;
-                }
-            } else {
-                if (!reorder_active) {
-                    // Start a timer to clear packets from reorder buffer if they have been
-                    // there too long.
-                    arm_reorder_buf_timer();
-                }
-                reorder_buf[seq_diff-1] = mbuf;
-                reorder_active          = true;
-                reorder_if_cnt[mbuf->if_index]++;
-                if_stats.reorders++;
-                continue;
-            }
-        }
-        circular_buffer_push(if_config[INGRESS_IF].if_txq.if_pkts, mbuf);
-        sem_post(&if_config[INGRESS_IF].if_txq.if_ready);
-        pkt_seq_no++;
-        // Send any additional packets that were accumulating in the reorder buffer
-        if (reorder_active) drain_reorder_buf(&reorder_active);
-    }
-
-    thread_exit_rc = 0;
-    pthread_exit(&thread_exit_rc);
-    return &thread_exit_rc;  // for compiler warnings
-}
+//// +----------------------------------------------------------------------------
+//// | Drain the reorder buf until a gap is found.
+//// +----------------------------------------------------------------------------
+//static void drain_reorder_buf(bool *reorder_active)
+//{
+//    int     i=0, j;
+//
+//    while ((reorder_buf[i] != NULL) && (i<REORDER_BUF_SZ)) {
+//        circular_buffer_push(if_config[INGRESS_IF].if_txq.if_pkts, reorder_buf[i]);
+//        sem_post(&if_config[INGRESS_IF].if_txq.if_ready);
+//        pkt_seq_no++;
+//        reorder_buf[i] = NULL;
+//        i++;
+//    }
+//    *reorder_active = false;
+//    reorder_if_cnt[0] = reorder_if_cnt[1] = 0;
+//    if (i<REORDER_BUF_SZ) {
+//        for (i=i+1, j=0; i<REORDER_BUF_SZ; i++, j++) {
+//            reorder_buf[j] = reorder_buf[i];
+//            if (reorder_buf[i] != NULL) {
+//                *reorder_active = true;
+//                reorder_if_cnt[reorder_buf[j]->if_index]++;
+//            }
+//            reorder_buf[i] = NULL;
+//        }
+//    }
+//    if (!reorder_active) disarm_reorder_buf_timer();
+//}
+//
+//
+//// +----------------------------------------------------------------------------
+//// | Completely drain the reorder buf.
+//// +----------------------------------------------------------------------------
+//static void force_drain_reorder_buf(void)
+//{
+//    int i;
+//
+//    if_config[0].if_ratio = reorder_if_cnt[0];
+//    if_config[1].if_ratio = reorder_if_cnt[1];
+//    for (i=0; i<REORDER_BUF_SZ; i++) {
+//        if (reorder_buf[i] != NULL) {
+//            circular_buffer_push(if_config[INGRESS_IF].if_txq.if_pkts, reorder_buf[i]);
+//            sem_post(&if_config[INGRESS_IF].if_txq.if_ready);
+//            reorder_buf[i] = NULL;
+//        }
+//    }
+//    reorder_if_cnt[0] = reorder_if_cnt[1] = 0;
+//}
+//
+//
+//// +----------------------------------------------------------------------------
+//// | Do the packet mangling on the home gateway between the vps and the home network.
+//// +----------------------------------------------------------------------------
+//static void *home_from_vps_pkt_mangler_thread(void * arg)
+//{
+//    struct mbuf_s   *mbuf;
+//    uint8_t         *seq_no;
+//    int             seq_diff;
+//    unsigned char   *mbufc;
+//    unsigned int    i;
+//    bool            reorder_active=false;
+//    struct in6_addr *sv_dest_addr6;
+//    struct ip6_hdr  *ip6hdr;
+//    struct in_addr  *sv_dest_addr;
+//    struct ip       *iphdr;
+//
+//    for (i=0; i<REORDER_BUF_SZ; i++) reorder_buf[i] = NULL;
+//    while (dsl_threads[HOME_FROM_VPS_PKT_MANGLER_THREADNO].keep_going) {
+//        sem_wait(&if_config[EGRESS_IF].if_rxq.if_ready);
+//        if ((mbuf = circular_buffer_pop(if_config[EGRESS_IF].if_rxq.if_pkts)) == NULL) continue;
+//        mbufc                   = (unsigned char *) mbuf;
+//        if (mbuf->ipv6) {
+//            ip6hdr                  = (struct ip6_hdr *) (mbufc + sizeof(struct ether_header));
+//            sv_dest_addr6           = (struct in6_addr *) (mbufc + sizeof(struct ether_header) + sizeof(struct ip6_hdr) + ip6hdr->ip6_plen);
+//            seq_no                  = (uint8_t *) (mbufc + sizeof(struct ether_header) + sizeof(struct ip6_hdr) + ip6hdr->ip6_plen + sizeof(struct in6_addr));
+//            memcpy(ip6hdr->ip6_dst.s6_addr, sv_dest_addr6, sizeof(struct in6_addr));
+//            ip6hdr->ip6_plen        = ip6hdr->ip6_plen - sizeof(struct in6_addr) - 1;
+//        } else {
+//        iphdr                   = (struct ip *) (mbufc + sizeof(struct ether_header));
+//            sv_dest_addr            = (struct in_addr *) (mbufc + sizeof(struct ether_header) + iphdr->ip_len);
+//            seq_no                  = (uint8_t *) (mbufc + sizeof(struct ether_header) + iphdr->ip_len + sizeof(struct in_addr));
+//            memcpy(&iphdr->ip_dst, sv_dest_addr, sizeof(struct in_addr));
+//            iphdr->ip_len           = iphdr->ip_len - sizeof(struct in_addr) - 1;
+//            iphdr->ip_sum           = iphdr_checksum((unsigned short*)(mbufc + sizeof(struct ether_header)), (sizeof(struct iphdr)/2));
+//        }
+//        seq_diff                = *seq_no - pkt_seq_no;
+//        if (seq_diff < 0) seq_diff = (255 - pkt_seq_no) + *seq_no + 1;
+//        if (seq_diff > 0) {
+//            if (seq_diff > REORDER_BUF_SZ) {
+//                // Packet we are waiting for is late, drain reorder buffer and let the tcp
+//                // layer deal with it.
+//                pkt_seq_no++;
+//                drain_reorder_buf(&reorder_active);
+//                seq_diff        = *seq_no - pkt_seq_no;
+//                if (seq_diff < 0) seq_diff = (255 - pkt_seq_no) + *seq_no + 1;
+//                if (seq_diff > 0) {
+//                    // There are multiple packets that are late, force drain the reorder
+//                    // buffer and let the tcp layer deal with it.
+//                    force_drain_reorder_buf();
+//                    pkt_seq_no = *seq_no;
+//                    reorder_active  = false;
+//                    disarm_reorder_buf_timer();
+//                    nf_stats.reorder_failures++;
+//                }
+//            } else {
+//                if (!reorder_active) {
+//                    // Start a timer to clear packets from reorder buffer if they have been
+//                    // there too long.
+//                    arm_reorder_buf_timer();
+//                }
+//                reorder_buf[seq_diff-1] = mbuf;
+//                reorder_active          = true;
+//                reorder_if_cnt[mbuf->if_index]++;
+//                nf_stats.reorders++;
+//                continue;
+//            }
+//        }
+//        circular_buffer_push(if_config[INGRESS_IF].if_txq.if_pkts, mbuf);
+//        sem_post(&if_config[INGRESS_IF].if_txq.if_ready);
+//        pkt_seq_no++;
+//        // Send any additional packets that were accumulating in the reorder buffer
+//        if (reorder_active) drain_reorder_buf(&reorder_active);
+//    }
+//
+//    thread_exit_rc = 0;
+//    pthread_exit(&thread_exit_rc);
+//    return &thread_exit_rc;  // for compiler warnings
+//}
 
 
 // +----------------------------------------------------------------------------
@@ -423,144 +451,51 @@ static int create_threads(void)
 {
     int rc;
 
-    snprintf(dsl_threads[0].thread_name, 16, "rx_thread0");
-    if ((rc = create_thread(&dsl_threads[0].thread_id, rx_thread, RXPRIO, dsl_threads[0].thread_name, (void *) &if_config[0].if_rxq)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create rx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[0].if_rxname, strerror(rc));
+    snprintf(nfq_config[INGRESS_NFQ].nf_thread.thread_name, 16, "rx_thread%2u", nfq_config[0].nfq_q_no);
+    if ((rc = create_thread(&nfq_config[INGRESS_NFQ].nf_thread.thread_id, rx_thread, RXPRIO, nfq_config[INGRESS_NFQ].nf_thread.thread_name, (void *) &nfq_config[INGRESS_NFQ])) != 0) {
+        log_msg(LOG_ERR, "%s-%d: Can not create rx thread for ingress netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
         return rc;
     }
-    snprintf(dsl_threads[1].thread_name, 16, "rx_thread1");
-    if ((rc = create_thread(&dsl_threads[1].thread_id, rx_thread, RXPRIO, dsl_threads[1].thread_name, (void *) &if_config[1].if_rxq)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create rx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[1].if_rxname, strerror(rc));
-        return rc;
-    }
-    snprintf(dsl_threads[2].thread_name, 16, "rx_thread2");
-    if ((rc = create_thread(&dsl_threads[2].thread_id, rx_thread, RXPRIO, dsl_threads[2].thread_name, (void *) &if_config[2].if_rxq)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create rx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[2].if_rxname, strerror(rc));
-        return rc;
-    }
-    snprintf(dsl_threads[3].thread_name, 16, "tx_thread0");
-    if ((rc = create_thread(&dsl_threads[3].thread_id, tx_thread, TXPRIO, dsl_threads[3].thread_name, (void *) &if_config[0].if_txq)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create tx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[0].if_txname, strerror(rc));
-        return rc;
-    }
-    snprintf(dsl_threads[4].thread_name, 16, "tx_thread1");
-    if ((rc = create_thread(&dsl_threads[4].thread_id, tx_thread, TXPRIO, dsl_threads[4].thread_name, (void *) &if_config[1].if_txq)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create tx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[1].if_txname, strerror(rc));
-        return rc;
-    }
-    snprintf(dsl_threads[5].thread_name, 16, "tx_thread2");
-    if ((rc = create_thread(&dsl_threads[5].thread_id, tx_thread, TXPRIO, dsl_threads[5].thread_name, (void *) &if_config[2].if_txq)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create tx thread for interface %s - %s.\n", __FUNCTION__, __LINE__, if_config[2].if_txname, strerror(rc));
-        return rc;
-    }
-    snprintf(dsl_threads[HOME_TO_VPS_PKT_MANGLER_THREADNO].thread_name, 16, "home_to_vps");
-    if ((rc = create_thread(&dsl_threads[HOME_TO_VPS_PKT_MANGLER_THREADNO].thread_id, home_to_vps_pkt_mangler_thread, HOME_TO_VPS_PRIO, dsl_threads[HOME_TO_VPS_PKT_MANGLER_THREADNO].thread_name, NULL)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create home to vps thread - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
-        return rc;
-    }
-    snprintf(dsl_threads[HOME_FROM_VPS_PKT_MANGLER_THREADNO].thread_name, 16, "home_from_vps");
-    if ((rc = create_thread(&dsl_threads[HOME_FROM_VPS_PKT_MANGLER_THREADNO].thread_id, home_from_vps_pkt_mangler_thread, HOME_FROM_VPS_PRIO, dsl_threads[HOME_FROM_VPS_PKT_MANGLER_THREADNO].thread_name, NULL)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create home from vps thread - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
-        return rc;
-    }
-    num_threads = 8;
     return 0;
 }
 
 // +----------------------------------------------------------------------------
 // | Handle a query on the comms socket
 // +----------------------------------------------------------------------------
-void handle_client_query(struct comms_query_s *query, int comms_client_fd, bool *connection_active)
+static void handle_client_command(struct comms_packet_s *query, struct comms_packet_s *reply,
+        int comms_client_fd, bool *connection_active)
 {
-    int                     rc, i, bytecnt;
-    struct comms_reply_s    reply;
-    char                    *query_c = (char *) query;
-    char                    *reply_c = (char *) &reply;
 
 //    log_debug_msg(LOG_INFO, "Received request %02x.\n", query->cmd);
-    if (query->for_peer) {
-//        log_debug_msg(LOG_INFO, "Request is for peer.\n");
-        if (comms_addr_valid) {
-            query->for_peer = false;
-            bytecnt = 0;
-//            log_debug_msg(LOG_INFO, "Sending request to peer.\n");
-            do {
-                if ((rc = send(comms_peer_fd, &query_c[bytecnt], sizeof(struct comms_query_s)-bytecnt, 0)) == -1) {
-                    log_msg(LOG_ERR, "%s-%d: Error sending comms request to remote peer - %s", __FUNCTION__, __LINE__, strerror(errno));
-                    reply.rc = errno;
-                    send(comms_client_fd, &reply, sizeof(struct comms_reply_s), 0);
-                    return;
-                }
-                bytecnt += rc;
-            } while (bytecnt < sizeof(struct comms_query_s));
-            bytecnt = 0;
-            do {
-                if ((rc = recv(comms_peer_fd, &reply_c[bytecnt], sizeof(struct comms_reply_s)-bytecnt, 0)) == -1) {
-                    log_msg(LOG_ERR, "%s-%d: Error receiving reply from remote peer - %s", __FUNCTION__, __LINE__, strerror(errno));
-                    reply.rc = errno;
-                    send(comms_client_fd, &reply, sizeof(struct comms_reply_s), 0);
-                    return;
-                }
-                bytecnt += rc;
-            } while (bytecnt < sizeof(struct comms_reply_s));
-//            log_debug_msg(LOG_INFO, "Received reply from peer, rc=%d.\n", reply.rc);
-            reply.rc = 0;
-        } else {
-            reply.rc = 1;
-        }
-    } else {
-        switch (query->cmd){
-            case COMMS_GETSTATS:
-                if_stats.mempool_freesz                         = mempool_freeSz(mPool);
-                if_stats.mempool_overheadsz                     = mempool_overheadSz(mPool);
-                if_stats.mempool_totalsz                        = mempool_totalSz(mPool);
-                for (i=0; i<if_stats.num_interfaces; i++) {
-                    if_stats.circular_buffer_rxq_freesz[i]      = circular_buffer_freesz(if_config[i].if_rxq.if_pkts);
-                    if_stats.circular_buffer_txq_freesz[i]      = circular_buffer_freesz(if_config[i].if_txq.if_pkts);
-                    if_stats.circular_buffer_rxq_overheadsz[i]  = circular_buffer_overheadsz(if_config[i].if_rxq.if_pkts);
-                    if_stats.circular_buffer_txq_overheadsz[i]  = circular_buffer_overheadsz(if_config[i].if_txq.if_pkts);
-                    if_stats.circular_buffer_rxq_sz[i]          = circular_buffer_sz(if_config[i].if_rxq.if_pkts);
-                    if_stats.circular_buffer_txq_sz[i]          = circular_buffer_sz(if_config[i].if_txq.if_pkts);
-                }
-                memcpy(&reply.stats, &if_stats, sizeof(struct statistics_s));
-                reply.rc    = 0;
-                break;
-            case COMMS_KILL:
-                reply.rc        = 0;
-                reply.is_client = true;
-                send(comms_client_fd, &reply, sizeof(struct comms_reply_s), 0);
-                exit_level1_cleanup();
-                exit(EXIT_SUCCESS);
-                break;
-            case COMMS_EXIT:
-                *connection_active  = false;
-                break;
-            case COMMS_SET_QCONTROL:
-                if (query->q_control_cnt == -1) {
-                    if_config[query->q_control_index].if_rxq.q_control      = false;
-                } else {
-                    if_config[query->q_control_index].if_rxq.q_control_cnt  = query->q_control_cnt;
-                    if_config[query->q_control_index].if_rxq.q_control      = true;
-                }
-                reply.rc            = 0;
-                break;
-            default:
-                log_debug_msg(LOG_INFO, "Received invalid request.\n");
-                reply.rc    = -1;
-        }
-        reply.is_client = true;
-    }
-
-    bytecnt = 0;
-    do {
-        if ((rc = send(comms_client_fd, &reply_c[bytecnt], sizeof(struct comms_reply_s)-bytecnt, 0)) == -1) {
-            log_msg(LOG_ERR, "%s-%d: Error sending comms request to remote peer - %s", __FUNCTION__, __LINE__, strerror(errno));
-            reply.rc = errno;
-            send(comms_client_fd, &reply, sizeof(struct comms_reply_s), 0);
-            return;
-        }
-        bytecnt += rc;
-    } while (bytecnt < sizeof(struct comms_reply_s));
+	switch (query->cmd){
+		case COMMS_GETSTATS:
+			memcpy(&reply->pyld.rply.stats, &nf_stats, sizeof(struct statistics_s));
+			reply->pyld.rply.rc    = 0;
+			break;
+		case COMMS_KILL:
+			reply->pyld.rply.rc        = 0;
+			reply->pyld.rply.is_client = true;
+			send(comms_client_fd, reply, sizeof(struct comms_packet_s), 0);
+			exit_level1_cleanup();
+			exit(EXIT_SUCCESS);
+			break;
+		case COMMS_EXIT:
+			*connection_active  = false;
+			break;
+		case COMMS_SET_QCONTROL:
+			if (query->pyld.qry.q_control_cnt == -1) {
+				nfq_config[query->pyld.qry.q_control_index].q_control      = false;
+			} else {
+				nfq_config[query->pyld.qry.q_control_index].q_control_cnt  = query->pyld.qry.q_control_cnt;
+				nfq_config[query->pyld.qry.q_control_index].q_control      = true;
+			}
+			reply->pyld.rply.rc            = 0;
+			break;
+		default:
+			log_debug_msg(LOG_INFO, "Received invalid request.\n");
+			reply->pyld.rply.rc    = -1;
+	}
+	reply->pyld.rply.is_client = true;
 }
 
 
@@ -570,9 +505,9 @@ void handle_client_query(struct comms_query_s *query, int comms_client_fd, bool 
 static void read_config_file(void)
 {
     config_t                cfg;
-    const config_setting_t  *config_egress_list;
+    const config_setting_t  *config_list;
     const char              *config_string=NULL;
-    int                     i, j;
+    int                     i;
 
     config_init(&cfg);
 
@@ -581,10 +516,8 @@ static void read_config_file(void)
         return;
     }
 
-    if (config_lookup_int(&cfg, "port", &cc_port))
+    if (config_lookup_int(&cfg, "comms_port", &cc_port))
         log_msg(LOG_INFO, "Configured for comms port on %d.\n", cc_port);
-    if (config_lookup_int(&cfg, "mbufs", &n_mbufs))
-        log_msg(LOG_INFO, "Configured for %d mbufs.\n", n_mbufs);
     if (config_lookup_int(&cfg, "ipversion", &i)) {
         if (i == 6) ipv6_mode = true;
         log_msg(LOG_INFO, "Configured for %s.\n", ipv6_mode ? "ipv6" : "ipv4");
@@ -592,6 +525,12 @@ static void read_config_file(void)
     if (config_lookup_bool(&cfg, "qcontrol", &i)) {
         q_control_on = i;
         log_msg(LOG_INFO, "Configured for debugging queue control %s.\n", q_control_on ? "on" : "off");
+    }
+    config_list = config_lookup(&cfg, "data_port");
+    for (i=0; i<config_setting_length(config_list); i++) {
+        if (i == NUM_NETFILTER_QUEUES) break;
+        if_config[i].if_port = config_setting_get_int_elem(config_list, i);
+        log_msg(LOG_INFO, "Configured for data port on %u.\n", if_config[i].if_port);
     }
     config_string = NULL;
     if (config_lookup_string(&cfg, "comms_name", &config_string)) {
@@ -603,18 +542,6 @@ static void read_config_file(void)
         log_msg(LOG_INFO, "Configured for comms on %s.\n", comms_name);
     }
     config_string = NULL;
-    if (config_lookup_string(&cfg, "client.ingress.input", &config_string)) {
-        strcpy(if_config[INGRESS_IF].if_rxname, config_string);
-        log_msg(LOG_INFO, "Configured for client ingress rx on %s.\n", if_config[INGRESS_IF].if_rxname);
-        ingresscnt = 1;
-    }
-    config_string = NULL;
-    if (config_lookup_string(&cfg, "client.ingress.output", &config_string)) {
-        strcpy(if_config[INGRESS_IF].if_txname, config_string);
-        log_msg(LOG_INFO, "Configured for client ingress tx on %s.\n", if_config[INGRESS_IF].if_txname);
-        ingresscnt = 1;
-    }
-    config_string = NULL;
     if (config_lookup_string(&cfg, "client.server_name", &config_string)) {
         if ((remote_name = malloc(strlen(config_string)+1)) == NULL) {
             log_msg(LOG_ERR, "%s-%d: Out of memory.\n", __FUNCTION__, __LINE__);
@@ -623,27 +550,125 @@ static void read_config_file(void)
         strcpy(remote_name, config_string);
         log_msg(LOG_INFO, "Configured for server name %s.\n", remote_name);
     }
-    config_egress_list = config_lookup(&cfg, "client.egress.input");
-    for (i=EGRESS_IF, j=0; i<config_setting_length(config_egress_list); i++, j++) {
-        if (j == 2) break;  // no more than two egress interfaces
+    config_list = config_lookup(&cfg, "client.egress.interface");
+    for (i=0; i<config_setting_length(config_list); i++) {
+        if (i == NUM_EGRESS_INTERFACES) break;
         egresscnt++;
-        strcpy(if_config[i].if_rxname, config_setting_get_string_elem(config_egress_list, j));
-        log_msg(LOG_INFO, "Configured for client egress rx interface on %s.\n", if_config[i].if_rxname);
+        strcpy(if_config[i].if_name, config_setting_get_string_elem(config_list, i));
+        log_msg(LOG_INFO, "Configured for client egress interface on %s.\n", if_config[i].if_name);
     }
-    config_egress_list = config_lookup(&cfg, "client.egress.output");
-    for (i=EGRESS_IF, j=0; i<config_setting_length(config_egress_list); i++, j++) {
-        if (j == 2) break;  // no more than two egress interfaces
-        strcpy(if_config[i].if_txname, config_setting_get_string_elem(config_egress_list, j));
-        log_msg(LOG_INFO, "Configured for client egress tx interface on %s.\n", if_config[i].if_txname);
+    config_list = config_lookup(&cfg, "client.egress.ratio");
+    for (i=0; i<config_setting_length(config_list); i++) {
+        if (i == egresscnt) break;
+        if_config[i].if_ratio = config_setting_get_int_elem(config_list, i);
+        log_msg(LOG_INFO, "Configured for client egress interface ratio of %u on %s.\n", if_config[i].if_ratio, if_config[i].if_name);
     }
-    config_egress_list = config_lookup(&cfg, "client.egress.ratio");
-    for (i=EGRESS_IF, j=0; i<config_setting_length(config_egress_list); i++, j++) {
-        if (j == egresscnt) break; // no more than 2 interface ratios
-        if_config[i].if_ratio = config_setting_get_int_elem(config_egress_list, j);
-        log_msg(LOG_INFO, "Configured for client egress interface ratio of %u on %s.\n", if_config[i].if_ratio, if_config[i].if_txname);
+    config_list = config_lookup(&cfg, "client.egress.fwmark");
+    for (i=0; i<config_setting_length(config_list); i++) {
+        if (i == egresscnt) break;
+        if_config[i].if_fwmark = config_setting_get_int_elem(config_list, i);
+        log_msg(LOG_INFO, "Configured for client egress interface fwmark of %u on %s.\n", if_config[i].if_fwmark, if_config[i].if_name);
+    }
+    if (config_lookup_int(&cfg, "client.egress.nf_q_no", &nfq_config[EGRESS_NFQ].nfq_q_no)) {
+        log_msg(LOG_INFO, "Configured for egress netfilter queue on %u.\n", nfq_config[EGRESS_NFQ].nfq_q_no);
+    }
+    if (config_lookup_int(&cfg, "client.ingress.nf_q_no", &nfq_config[INGRESS_NFQ].nfq_q_no)) {
+        log_msg(LOG_INFO, "Configured for ingress netfilter queue on %u.\n", nfq_config[INGRESS_NFQ].nfq_q_no);
     }
 
     config_destroy(&cfg);
+}
+
+
+// +----------------------------------------------------------------------------
+// | Process packets from server received on the two data port connections. This
+// | function calculates the transmission times on each of the egress interfaces.
+// +----------------------------------------------------------------------------
+static bool process_data_port_packet(int fd, int ifindex)
+{
+    struct data_port_ping_s        data_port_ping;
+    int                            rc;
+
+    while (((rc = recv(fd, &data_port_ping, sizeof(data_port_ping), 0)) == -1) && (errno == EINTR));
+    if (rc == 0) {
+        log_msg(LOG_WARNING, "Closing data port connections.\n");
+        close(if_config[EGRESS_IF].if_peer_fd);
+        close(if_config[EGRESS_IF+1].if_peer_fd);
+        return false;
+    }
+    if (rc > 0) {
+        if (rc != sizeof(data_port_ping)) {
+            log_msg(LOG_INFO, "Data port packet dropped - invalid size %d.\n", rc);
+        } else {
+            log_msg(LOG_INFO, "Received data port packet from port %u.\n", if_config[ifindex].if_port);
+        }
+    } else {
+        log_msg(LOG_WARNING, "Data port receive returns %s.\n", strerror(errno));
+    }
+    return true;
+}
+
+
+// +----------------------------------------------------------------------------
+// | Open a socket and connect to peer
+// +----------------------------------------------------------------------------
+static int connect_to_server(struct sockaddr_storage *addr, socklen_t addr_sz, sa_family_t ip_family) {
+    int            rc, fd;
+
+    if ((fd = socket(ip_family, SOCK_STREAM, 0)) < 0) {
+        rc = -1*errno;
+        log_msg(LOG_ERR, "%s-%d: Can not create socket - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+        return rc;
+    }
+
+    if (connect(fd, (struct sockaddr *) addr, addr_sz) < 0) {
+        rc = -1*errno;
+        log_msg(LOG_ERR, "%s-%d: Not connected - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+        return rc;
+    }
+
+    return fd;
+}
+
+// +----------------------------------------------------------------------------
+// | Connect to the server on the comms port
+// +----------------------------------------------------------------------------
+static int reconnect_comms_to_server(void)
+{
+
+    log_debug_msg(LOG_INFO, "%s-%d\n", __FUNCTION__, __LINE__);
+    if (comms_peer_fd > -1) close(comms_peer_fd);
+
+    // Convert server name to server ip address
+    if (ipv6_mode) {
+        if ((name_to_ip(comms_name, (struct sockaddr_storage *) &comms_addr6, AF_INET6)) != 0)
+        {
+            log_msg(LOG_ERR, "%s-%d: Could not translate hostname %s into ip address.\n", __FUNCTION__, __LINE__, comms_name);
+            return -EINVAL;
+        }
+        comms_addr6.sin6_port       = htons((unsigned short)cc_port);
+        log_msg(LOG_INFO, "Waiting for connection to server %s on port %u...", comms_name, cc_port);
+        if ((comms_peer_fd = connect_to_server((struct sockaddr_storage *) &comms_addr6, sizeof(comms_addr6), AF_INET6)) < 0) {
+            log_msg(LOG_INFO, "Not connected.\n");
+            return comms_peer_fd;
+        }
+    } else {
+        if ((name_to_ip(comms_name, (struct sockaddr_storage *) &comms_addr, AF_INET)) != 0)
+        {
+            log_msg(LOG_ERR, "%s-%d: Could not translate hostname %s into ip address.\n", __FUNCTION__, __LINE__, comms_name);
+            return -EINVAL;
+        }
+        comms_addr.sin_port        = htons((unsigned short)cc_port);
+        log_msg(LOG_INFO, "Waiting for connection to server %s on port %u...", comms_name, cc_port);
+        if ((comms_peer_fd = connect_to_server((struct sockaddr_storage *) &comms_addr, sizeof(comms_addr), AF_INET)) < 0) {
+            log_msg(LOG_INFO, "Not connected.\n");
+            return comms_peer_fd;
+        }
+    }
+    log_msg(LOG_INFO, "Connected.\n");
+
+    comms_addr_valid = true;
+    return 0;
 }
 
 
@@ -652,16 +677,16 @@ static void read_config_file(void)
 // +----------------------------------------------------------------------------
 int main(int argc, char *argv[])
 {
-    int                         option, i, rc;
-    bool                        daemonize = true;
+    int                         option, i, j, rc, readset_fd;
+    bool                        daemonize=true, keep_going=true;
     pid_t                       pid, sid;
     struct sigaction            sigact;
     struct sched_param          sparam;
-    struct sigevent             se;
-    struct comms_query_s        client_query;
-    struct comms_reply_s        client_response;
-    struct ifreq                ifr;
-    sem_t                       goodnight;
+//    struct sigevent             se;
+    struct comms_packet_s       client_query;
+    struct comms_packet_s       client_response;
+    char                        ipaddr[INET6_ADDRSTRLEN];
+    fd_set                      readset;
 
     i=0;
     if (argv[0][0] == '.' || argv[0][0] == '/') i++;
@@ -671,12 +696,19 @@ int main(int argc, char *argv[])
     memset(config_file_name, 0, PATH_MAX);
     strcpy(config_file_name, DEFAULT_CONFIG_FILE_NAME);
 
-    for (i=0; i<NUM_INGRESS_INTERFACES+NUM_EGRESS_INTERFACES; i++) {
+    for (i=0; i<NUM_EGRESS_INTERFACES; i++) {
         memset(&if_config[i], 0, sizeof(struct if_config_s));
     }
-    memset(&if_stats, 0, sizeof(struct statistics_s));
-    memset(dsl_threads, 0, sizeof(struct thread_list_s)*9);
-    for (i=0; i<9; i++) dsl_threads[i].keep_going = true;
+    for (i=0; i<NUM_NETFILTER_QUEUES; i++) {
+        memset(&nfq_config[i], 0, sizeof(struct nf_queue_config_s));
+    }
+    memset(&nf_stats, 0, sizeof(struct statistics_s));
+
+    // Setup the client exit cleanup function
+    exit_level2_cleanup = client_level2_cleanup;
+
+    // Setup the comms packet command handler
+    handle_comms_command = handle_client_command;
 
     // Hook the sigterm and sigint signals
     memset(&sigact, 0, sizeof(sigact));
@@ -752,11 +784,6 @@ int main(int argc, char *argv[])
         exit(EINVAL);
     }
 
-    if (ingresscnt == 0) {
-        log_msg(LOG_ERR, "You must provide an ingress interface name in the config file.\n\n");
-        exit(EINVAL);
-    }
-
     if (egresscnt == 0) {
         log_msg(LOG_ERR, "You must provide an egress interface name in the config file.\n\n");
         exit(EINVAL);
@@ -769,108 +796,24 @@ int main(int argc, char *argv[])
                 __FUNCTION__, __LINE__, strerror(errno));
     }
 
-    // Allocate the memory pool for mbufs
-    if ((mPool = mempool_create(sizeof(struct mbuf_s), n_mbufs)) == MEM_POOL_INVALID) {
-        log_msg(LOG_ERR, "%s-%d: Out of memory.\n", __FUNCTION__, __LINE__);
-        exit(ENOMEM);
-    }
+    // Get ip addresses of all the egress interfaces
+    //get_ip_addrs();
 
-    // Open egress interfaces,
-    // allocate rx and tx circular buffers for egress interfaces. Note there are
-    // two egress interfaces on the home gateway, and one on the vps
-    open_egress_interfaces();
-
-    // Get ip addresses of all the interfaces
-    get_ip_addrs();
-    
-    // Open raw socket for ingress tx interface, opened in IP mode so we don't have to
-    // provide the ethernet header.
-    if ((if_config[INGRESS_IF].if_tx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP))) < 0) {
-        rc = errno;
-        log_msg(LOG_ERR, "%s-%d: Can not create tx socket for ingress interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
-        exit_level1_cleanup();
-        exit(rc);
-    }
-    memset(&ifr, 0, sizeof(ifr));
-    if (ipv6_mode)
-        ifr.ifr_addr.sa_family = AF_INET6;
-    else
-        ifr.ifr_addr.sa_family = AF_INET;
-    strncpy(ifr.ifr_name, if_config[INGRESS_IF].if_txname, sizeof(ifr.ifr_name));
-    // Bind raw socket to a particular interface name (eg: ppp0 or ppp1)
-    if (setsockopt(if_config[INGRESS_IF].if_tx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
-        rc = errno;
-        log_msg(LOG_ERR, "%s-%d: Can not bind socket to %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
-        exit_level1_cleanup();
-        exit(rc);
-    }
-    // Open ingress rx socket interface, this socket is opened such that we get the ethernet
-    // header as well as the ip header
-    if ((if_config[INGRESS_IF].if_rx_fd = tuntap_init(if_config[INGRESS_IF].if_rxname)) < 0) {
-        rc = errno;
-        log_msg(LOG_ERR, "%s-%d: Can not create rx socket for ingress rx interface %d - %s.\n", __FUNCTION__, __LINE__, i, strerror(errno));
-        exit_level1_cleanup();
-        exit(rc);
-    }
-    // Bind raw socket to a particular interface name (eg: ppp0 or ppp1)
-//    if (setsockopt(if_config[INGRESS_IF].if_rx_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
+    // Create timer to handle reorder buffer timeouts
+//    se.sigev_notify             = SIGEV_THREAD;
+//    se.sigev_value.sival_ptr    = &reorder_buf_timerid;
+//    se.sigev_notify_function    = reorder_buf_timer;
+//    se.sigev_notify_attributes  = NULL;
+//    if (timer_create(CLOCK_MONOTONIC, &se, &reorder_buf_timerid) == -1) {
 //        rc = errno;
-//        log_msg(LOG_ERR, "%s-%d: Can not bind socket to %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
+//        log_msg(LOG_ERR, "%s-%d: Failure to create reorder buffer timer - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
 //        exit_level1_cleanup();
 //        exit(rc);
 //    }
-
-    // Create the rx and tx queues for ingress interface
-    if_config[INGRESS_IF].if_rxq.if_index  = INGRESS_IF;
-    if_config[INGRESS_IF].if_rxq.if_thread = &dsl_threads[4];
-    if ((if_config[INGRESS_IF].if_rxq.if_pkts   = circular_buffer_create(n_mbufs/(ingresscnt+egresscnt), mPool)) == CIRCULAR_BUFFER_INVALID) {
-        log_msg(LOG_ERR, "%s-%d: Failure to create rx circular buffer for index 0.\n", __FUNCTION__, __LINE__);
-        exit_level1_cleanup();
-        exit(ENOMEM);
-    }
-    if (sem_init(&if_config[INGRESS_IF].if_rxq.if_ready, 0, 0) == -1) {
-        rc = errno;
-        log_msg(LOG_ERR, "%s-%d: Failure to create rx queue semaphore for index 0 - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-        exit_level1_cleanup();
-        exit(rc);
-    }
-    if (q_control_on) {
-        if_config[INGRESS_IF].if_rxq.q_control       = true;
-        if_config[INGRESS_IF].if_rxq.q_control_cnt   = 0;
-    } else if_config[INGRESS_IF].if_rxq.q_control    = false;
-    if_config[INGRESS_IF].if_txq.if_index  = INGRESS_IF;
-    if_config[INGRESS_IF].if_txq.if_thread = &dsl_threads[5];
-    if ((if_config[INGRESS_IF].if_txq.if_pkts   = circular_buffer_create(n_mbufs/(ingresscnt+egresscnt), mPool)) == CIRCULAR_BUFFER_INVALID) {
-        log_msg(LOG_ERR, "%s-%d: Failure to tx create circular buffer for index 0.\n", __FUNCTION__, __LINE__);
-        exit_level1_cleanup();
-        exit(ENOMEM);
-    }
-    if (sem_init(&if_config[INGRESS_IF].if_txq.if_ready, 0, 0) == -1) {
-        rc = errno;
-        log_msg(LOG_ERR, "%s-%d: Failure to create tx queue semaphore for index 0 - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-        exit_level1_cleanup();
-        exit(rc);
-    }
-    if (q_control_on) {
-        if_config[INGRESS_IF].if_txq.q_control       = true;
-        if_config[INGRESS_IF].if_txq.q_control_cnt   = 0;
-    } else if_config[INGRESS_IF].if_txq.q_control    = false;
-
-    // Create timer to handle reorder buffer timeouts
-    se.sigev_notify             = SIGEV_THREAD;
-    se.sigev_value.sival_ptr    = &reorder_buf_timerid;
-    se.sigev_notify_function    = reorder_buf_timer;
-    se.sigev_notify_attributes  = NULL;
-    if (timer_create(CLOCK_MONOTONIC, &se, &reorder_buf_timerid) == -1) {
-        rc = errno;
-        log_msg(LOG_ERR, "%s-%d: Failure to create reorder buffer timer - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-        exit_level1_cleanup();
-        exit(rc);
-    }
-    reorder_buf_intvl.it_interval.tv_sec    = 0;
-    reorder_buf_intvl.it_interval.tv_nsec   = 200 * ONE_MS;
-    reorder_buf_intvl.it_value.tv_sec       = 0;
-    reorder_buf_intvl.it_value.tv_nsec      = 200 * ONE_MS;
+//    reorder_buf_intvl.it_interval.tv_sec    = 0;
+//    reorder_buf_intvl.it_interval.tv_nsec   = 200 * ONE_MS;
+//    reorder_buf_intvl.it_value.tv_sec       = 0;
+//    reorder_buf_intvl.it_value.tv_nsec      = 200 * ONE_MS;
 
     // Convert server name to server ip address
     if (ipv6_mode) {
@@ -890,27 +833,82 @@ int main(int argc, char *argv[])
     }
 
     // Start comms thread
-    process_comms();
+    //process_comms();
 
-    if ((rc = reconnect_comms_to_server()) != 0) {
+    while ((rc = reconnect_comms_to_server()) != 0) sleep(5);
+
+    // Initialize netfilter queue config
+    nfq_config[INGRESS_NFQ].nfq_cb                    = &home_to_vps_pkt_mangler_cb;
+    nfq_config[INGRESS_NFQ].nf_index                = INGRESS_NFQ;
+    nfq_config[INGRESS_NFQ].nf_thread.keep_going    = true;
+    if (q_control_on) {
+        nfq_config[INGRESS_NFQ].q_control            = true;
+        nfq_config[INGRESS_NFQ].q_control_cnt        = 0;
+    }
+    else {
+        nfq_config[INGRESS_NFQ].q_control            = false;
+    }
+    if ((nfq_config[INGRESS_NFQ].h = nfq_open()) == NULL) {
+        rc = errno;
+        log_msg(LOG_ERR, "%s-%d: Error opening netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
         exit_level1_cleanup();
         exit(rc);
     }
-    
+
+    if (ipv6_mode) {
+        if (nfq_unbind_pf(nfq_config[INGRESS_NFQ].h, AF_INET6) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Error unbinding from netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        }
+        if (nfq_bind_pf(nfq_config[INGRESS_NFQ].h, AF_INET6) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Error binding to netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        }
+    } else {
+        if (nfq_unbind_pf(nfq_config[INGRESS_NFQ].h, AF_INET) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Error unbinding from netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        }
+        if (nfq_bind_pf(nfq_config[INGRESS_NFQ].h, AF_INET) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Error binding to netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        }
+    }
+
+//    nfq_config[EGRESS_NFQ].nfq_cb                    = &home_to_vps_pkt_mangler_cb;
+//    nfq_config[EGRESS_NFQ].nf_index                    = EGRESS_NFQ;
+//    nfq_config[EGRESS_NFQ].nf_thread.keep_going        = true;
+    nfq_config[EGRESS_NFQ].h                        = nfq_config[INGRESS_NFQ].h;
+    if (q_control_on) {
+        nfq_config[EGRESS_NFQ].q_control            = true;
+        nfq_config[EGRESS_NFQ].q_control_cnt        = 0;
+    }
+    else {
+        nfq_config[EGRESS_NFQ].q_control            = false;
+    }
+
     // Handshake with server, send helo message and wait for ack.
     if (ipv6_mode) {
-        memcpy(&client_query.helo_data.egress_addr[0], &if_config[0].if_ipaddr, sizeof(struct sockaddr_in6));
-        memcpy(&client_query.helo_data.egress_addr[1], &if_config[1].if_ipaddr, sizeof(struct sockaddr_in6));
+        memcpy(&client_query.pyld.qry.helo_data.egress_addr[0], &if_config[0].if_ipaddr, sizeof(struct sockaddr_in6));
+        memcpy(&client_query.pyld.qry.helo_data.egress_addr[1], &if_config[1].if_ipaddr, sizeof(struct sockaddr_in6));
     } else {
-        memcpy(&client_query.helo_data.egress_addr[0], &if_config[0].if_ipaddr, sizeof(struct sockaddr_in));
-        memcpy(&client_query.helo_data.egress_addr[1], &if_config[1].if_ipaddr, sizeof(struct sockaddr_in));
+        memcpy(&client_query.pyld.qry.helo_data.egress_addr[0], &if_config[0].if_ipaddr, sizeof(struct sockaddr_in));
+        memcpy(&client_query.pyld.qry.helo_data.egress_addr[1], &if_config[1].if_ipaddr, sizeof(struct sockaddr_in));
     }
-    client_query.helo_data.if_ratio[0]      = if_config[0].if_ratio;
-    client_query.helo_data.if_ratio[1]      = if_config[1].if_ratio;
-    client_query.helo_data.cc_port          = cc_port;
-    client_query.for_peer                   = false;
-    client_query.helo_data.ipv6_mode        = ipv6_mode;
-    client_query.cmd                        = COMMS_HELO;
+    client_query.pyld.qry.helo_data.if_ratio[0] = if_config[0].if_ratio;
+    client_query.pyld.qry.helo_data.if_ratio[1] = if_config[1].if_ratio;
+    client_query.pyld.qry.helo_data.cc_port     = cc_port;
+    client_query.pyld.qry.for_peer              = false;
+    client_query.pyld.qry.helo_data.ipv6_mode   = ipv6_mode;
+    client_query.cmd                        	= COMMS_HELO;
     send(comms_peer_fd, &client_query, sizeof(struct comms_query_s), 0);
     while((rc = recv(comms_peer_fd, &client_response, sizeof(struct comms_reply_s), 0) == -1) && (errno == EINTR));
     if (rc == -1) {
@@ -919,28 +917,99 @@ int main(int argc, char *argv[])
         exit_level1_cleanup();
         exit(rc);
     }
-    if (client_response.rc != 0) {
-        log_msg(LOG_ERR, "%s-%d: Did not receive helo ack - rc=%d.\n", __FUNCTION__, __LINE__, client_response.rc);
+    if (client_response.pyld.rply.rc != 0) {
+        log_msg(LOG_ERR, "%s-%d: Did not receive helo ack - rc=%d.\n", __FUNCTION__, __LINE__, client_response.pyld.rply.rc);
     } else {
-        log_msg(LOG_INFO, "Received HELO ack - rc=%d.\n", client_response.rc);
+        log_msg(LOG_INFO, "Received HELO ack - rc=%d.\n", client_response.pyld.rply.rc);
     }
-    if_stats.num_interfaces = 3;
-    if_stats.ipv6_mode      = ipv6_mode;
-    for (i=0; i<if_stats.num_interfaces; i++) {
-        strncpy(if_stats.if_name[i], if_config[i].if_txname, IFNAMSIZ);
-    }
+    nf_stats.ipv6_mode      = ipv6_mode;
 
     // Start up the client threads
     if (create_threads()) {
         exit_level1_cleanup();
-    	exit(EFAULT);
+        exit(EFAULT);
     }
 
-    log_msg(LOG_INFO, "%s daemon started.\n", progname);
-    
-    // Go to sleep on a locked semaphore
-    sem_init(&goodnight, 0, 0);
-    sem_wait(&goodnight);
-    
+    for (;;) {
+        log_msg(LOG_INFO, "Waiting for data port connections.\n");
+        // Accept the data port connections
+        for (i=0; i<NUM_EGRESS_INTERFACES; i++) {
+            if (ipv6_mode) {
+                if_config[i].if_sin_size = sizeof(if_config[i].if_peer_client_addr6);
+                if ((if_config[i].if_peer_fd = accept(if_config[i].if_fd, (struct sockaddr *)&if_config[i].if_peer_client_addr6, &if_config[i].if_sin_size)) < 0) {
+                    log_msg(LOG_ERR, "%s-%d: Error accepting peer data connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+                    continue;
+                }
+                inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&if_config[i].if_peer_client_addr6), ipaddr, sizeof ipaddr);
+                if (memcmp(&if_config[i].if_peer_client_addr6.sin6_addr, &peer_addr6.sin6_addr, sizeof(struct in6_addr)) != 0) {
+                    log_msg(LOG_INFO, "Closing connection from unknown host %s.\n", ipaddr);
+                    close(if_config[i].if_peer_fd);
+                    continue;
+                }
+                log_msg(LOG_INFO, "Accepted peer data connection from %s on port %u.\n", ipaddr, if_config[i].if_port);
+                if_config[i].if_peer_client_addr6.sin6_port = if_config[i].if_port;
+                for (j=0; j<5; j++) {
+                    if ((if_config[i].if_peer_fd = connect_to_server((struct sockaddr_storage *)&if_config[i].if_peer_client_addr6, sizeof(struct sockaddr_in6), AF_INET6)) < 0) {
+                        sleep(2);
+                        log_msg(LOG_INFO, "Retrying data connection to server.\n");
+                    }
+                    else break;
+                }
+            } else {
+                if_config[i].if_sin_size = sizeof(if_config[i].if_peer_client_addr);
+                if ((if_config[i].if_peer_fd = accept(if_config[i].if_fd, (struct sockaddr *)&if_config[i].if_peer_client_addr, &if_config[i].if_sin_size)) < 0) {
+                    log_msg(LOG_ERR, "%s-%d: Error accepting peer data connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+                    continue;
+                }
+                inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&if_config[i].if_peer_client_addr), ipaddr, sizeof ipaddr);
+                if (if_config[i].if_peer_client_addr.sin_addr.s_addr != peer_addr.sin_addr.s_addr) {
+                    log_msg(LOG_INFO, "Closing connection from unknown host %s.\n", ipaddr);
+                    close(if_config[i].if_peer_fd);
+                    continue;
+                }
+                log_msg(LOG_INFO, "Accepted peer data connection from %s on port %u.\n", ipaddr, if_config[i].if_port);
+                if_config[i].if_peer_client_addr.sin_port = if_config[i].if_port;
+                for (j=0; j<5; j++) {
+                    if ((if_config[i].if_peer_fd = connect_to_server((struct sockaddr_storage *)&if_config[i].if_peer_client_addr, sizeof(struct sockaddr_in), AF_INET)) < 0) {
+                        sleep(2);
+                        log_msg(LOG_INFO, "Retrying data connection to server.\n");
+                    }
+                    else break;
+                }
+            }
+        }
+
+        if (if_config[EGRESS_IF].if_peer_fd < 0 || if_config[EGRESS_IF+1].if_peer_fd < 0) {
+            log_msg(LOG_ERR, "Can not establish data connections to server.\n");
+            exit_level1_cleanup();
+            exit(EFAULT);
+        }
+
+        if (if_config[EGRESS_IF].if_peer_fd > if_config[EGRESS_IF+1].if_peer_fd) readset_fd = if_config[EGRESS_IF].if_peer_fd;
+        else                                                                     readset_fd = if_config[EGRESS_IF+1].if_peer_fd;
+
+        log_msg(LOG_INFO, "%s daemon started.\n", progname);
+
+        // Process data connection ping packets
+        while (keep_going) {
+            FD_ZERO(&readset);
+            FD_SET(if_config[EGRESS_IF].if_peer_fd, &readset);
+            FD_SET(if_config[EGRESS_IF+1].if_peer_fd, &readset);
+            while (((rc = select(readset_fd + 1, &readset, NULL, NULL, NULL)) == -1) && (errno == EINTR));
+            if (rc == -1) {
+                log_msg(LOG_WARNING, "Select returns %s.\n", strerror(errno));
+                continue;
+            }
+            if (FD_ISSET(if_config[EGRESS_IF].if_peer_fd, &readset)) {
+                keep_going = process_data_port_packet(if_config[EGRESS_IF].if_peer_fd, EGRESS_IF);
+            }
+            if (FD_ISSET(if_config[EGRESS_IF+1].if_peer_fd, &readset)) {
+                keep_going = process_data_port_packet(if_config[EGRESS_IF+1].if_peer_fd, EGRESS_IF+1);
+            }
+        }
+        keep_going = true;
+    }
+
+    exit_level1_cleanup();
     exit(EFAULT);
 }

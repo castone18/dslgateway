@@ -40,7 +40,6 @@ extern "C" {
 #define HOME_FROM_VPS_PRIO                  40
 #define VPS_PKT_MANGLER_PRIO                40
 #define IFRATIO_CHANGE_PRIO                 20
-#define INGRESS_IF                          2
 #define EGRESS_IF                           0
 #define REORDER_BUF_SZ                      8
 #define ONE_MS                              1000000
@@ -50,16 +49,17 @@ extern "C" {
 #define HOME_FROM_VPS_PKT_MANGLER_THREADNO  7
 #define VPS_PKT_MANGLER_THREADNO            2
 #define DEFAULT_CONFIG_FILE_NAME            "/etc/dslgateway.cfg"
+#define EGRESS_NFQ							1
+#define INGRESS_NFQ							0
+#define PING_TRAINING_CNT					10
 
 struct tcp_mbuf_s {
-    struct ether_header eth_hdr;
     struct ip           ip_hdr;
     struct tcphdr       tcp_hdr;
     unsigned char       payload[ETHERMTU];
 };
 
 struct udp_mbuf_s {
-    struct ether_header eth_hdr;
     struct ip           ip_hdr;
     struct udphdr       udp_hdr;
     unsigned char       payload[ETHERMTU];
@@ -72,7 +72,8 @@ union mbuf_u {
 
 struct mbuf_s {
     union mbuf_u        pkt;
-    unsigned int        if_index;
+    uint32_t        	nfq_index;
+    ssize_t				len;
     struct timespec     rx_time;
     uint8_t             seq_no;
     bool                for_home;
@@ -85,44 +86,54 @@ struct thread_list_s {
     bool        keep_going;
 };
 
-struct if_queue_s {
-    unsigned int            if_index;
-    circular_buffer         if_pkts;
-    sem_t                   if_ready;
-    struct thread_list_s    *if_thread;
-    unsigned int            q_control_cnt;
-    bool                    q_control;
-};
-
 struct comms_thread_parms_s {
     int         peer_fd;
     pthread_t   thread_id;
 };
 
 struct if_config_s {
-    int                     if_rx_fd;
-    int                     if_tx_fd;
-    char                    if_rxname[IFNAMSIZ];
-    char                    if_txname[IFNAMSIZ];
-    struct if_queue_s       if_rxq;
-    struct if_queue_s       if_txq;
-    uint8_t                 if_ratio;
+    int                     if_fd;
+    int						if_peer_fd;
+    uint32_t				if_port;
+    char                    if_name[IFNAMSIZ];
     struct sockaddr_storage if_ipaddr;
+    uint8_t                 if_ratio;
+    int						if_index;
+    uint32_t				if_fwmark;
+    struct sockaddr_in6     if_peer_client_addr6;
+    struct sockaddr_in      if_peer_client_addr;
+    socklen_t               if_sin_size;
+    uint32_t				if_train_cnt;
+    struct timespec			if_diff;
+    bool					if_trained;
+    bool					if_peer_ts_greater;
 };
 
+struct nf_queue_config_s {
+	uint32_t				nfq_q_no;
+    int 					(*nfq_cb)(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
+    	      	  	  	  	  	  struct nfq_data *nfa, void *data);
+    struct nfq_handle 		*h;
+    struct nfq_q_handle 	*qh;
+    uint32_t                nf_index;
+    struct thread_list_s    nf_thread;
+    unsigned int            q_control_cnt;
+    bool                    q_control;
+};
+
+struct data_port_ping_s {
+	struct timespec		ts;
+	struct timespec		ts_diff;
+};
 
 void exit_level1_cleanup(void);
 void signal_handler(int sig);
-void *tx_thread(void * arg);
-int reconnect_comms_to_server(void);
-void open_egress_interfaces(void);
 void get_ip_addrs(void);
-void process_comms(void);
 void usage(char *progname);
-void handle_client_query(struct comms_query_s *query, int comms_client_fd, bool *connection_active);
 unsigned short iphdr_checksum(unsigned short* buff, int _16bitword);
-void process_remote_comms(void);
-int tuntap_init(char *ifname);
+void *comms_thread(void *arg);
+int send_comms_pkt(int fd, const void *buf, size_t len);
+int recv_comms_pkt(int fd, void *buf, size_t len);
 
 #ifdef __cplusplus
 }
