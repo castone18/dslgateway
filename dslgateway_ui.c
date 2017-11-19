@@ -170,7 +170,7 @@ void get_ip_str(const struct sockaddr *sa, char *s, size_t maxlen)
     return;
 }
 
-static void print_stats(struct comms_reply_s *clnt_rply, struct comms_reply_s *srvr_rply)
+static void print_stats(struct comms_packet_s *clnt_rply, struct comms_packet_s *srvr_rply)
 {
     char                client_ip_str[2][INET6_ADDRSTRLEN];
     struct sockaddr_in6 *addr6;
@@ -178,47 +178,47 @@ static void print_stats(struct comms_reply_s *clnt_rply, struct comms_reply_s *s
 
     printf("\nDSLgateway statistics:\n");
 	printf("                       Local Ingress         Local Egress       Remote Ingress        Remote Egress\n");
-	printf("Rx Packets:      %19llu  %19llu  %19llu  %19llu\n", clnt_rply->stats.nf_rx_pkts[INGRESS_NFQ],
-			clnt_rply->stats.nf_rx_pkts[EGRESS_NFQ], srvr_rply->stats.nf_rx_pkts[INGRESS_NFQ],
-			srvr_rply->stats.nf_rx_pkts[EGRESS_NFQ]);
-	printf("Tx Packets:      %19llu  %19llu  %19llu  %19llu\n", clnt_rply->stats.nf_tx_pkts[INGRESS_NFQ],
-			clnt_rply->stats.nf_tx_pkts[EGRESS_NFQ], srvr_rply->stats.nf_tx_pkts[INGRESS_NFQ],
-			srvr_rply->stats.nf_tx_pkts[EGRESS_NFQ]);
-	printf("Rx Bytes:        %19llu  %19llu  %19llu  %19llu\n", clnt_rply->stats.nf_rx_bytes[INGRESS_NFQ],
-			clnt_rply->stats.nf_rx_bytes[EGRESS_NFQ], srvr_rply->stats.nf_rx_bytes[INGRESS_NFQ],
-			srvr_rply->stats.nf_rx_bytes[EGRESS_NFQ]);
-	printf("Tx Bytes:        %19llu  %19llu  %19llu  %19llu\n", clnt_rply->stats.nf_tx_bytes[INGRESS_NFQ],
-			clnt_rply->stats.nf_tx_bytes[EGRESS_NFQ], srvr_rply->stats.nf_tx_bytes[INGRESS_NFQ],
-			srvr_rply->stats.nf_tx_bytes[EGRESS_NFQ]);
-	printf("Dropped:         %19llu  %19llu  %19llu  %19llu\n", clnt_rply->stats.nf_dropped_pkts[INGRESS_NFQ],
-			clnt_rply->stats.nf_dropped_pkts[EGRESS_NFQ], srvr_rply->stats.nf_dropped_pkts[INGRESS_NFQ],
-			srvr_rply->stats.nf_dropped_pkts[EGRESS_NFQ]);
-	printf("Dropped (ratio): %19llu  %19llu  %19llu  %19llu\n", clnt_rply->stats.nf_dropped_pkts_ratio[INGRESS_NFQ],
-			clnt_rply->stats.nf_dropped_pkts_ratio[EGRESS_NFQ], srvr_rply->stats.nf_dropped_pkts_ratio[INGRESS_NFQ],
-			srvr_rply->stats.nf_dropped_pkts_ratio[EGRESS_NFQ]);
-	printf("Dropped (proto): %19llu  %19llu  %19llu  %19llu\n", clnt_rply->stats.nf_dropped_pkts_proto[INGRESS_NFQ],
-			clnt_rply->stats.nf_dropped_pkts_proto[EGRESS_NFQ], srvr_rply->stats.nf_dropped_pkts_proto[INGRESS_NFQ],
-			srvr_rply->stats.nf_dropped_pkts_proto[EGRESS_NFQ]);
-	printf("Dropped (qctl):  %19llu  %19llu  %19llu  %19llu\n", clnt_rply->stats.nf_dropped_pkts_qcontrol[INGRESS_NFQ],
-			clnt_rply->stats.nf_dropped_pkts_qcontrol[EGRESS_NFQ], srvr_rply->stats.nf_dropped_pkts_qcontrol[INGRESS_NFQ],
-			srvr_rply->stats.nf_dropped_pkts_qcontrol[EGRESS_NFQ]);
-	printf("Dropped (space): %19llu  %19llu  %19llu  %19llu\n\n", clnt_rply->stats.nf_dropped_pkts_space[INGRESS_NFQ],
-			clnt_rply->stats.nf_dropped_pkts_space[EGRESS_NFQ], srvr_rply->stats.nf_dropped_pkts_space[INGRESS_NFQ],
-			srvr_rply->stats.nf_dropped_pkts_space[EGRESS_NFQ]);
-	printf("Client Reorders: %19llu     Reorder Failures: %19llu\n", clnt_rply->stats.reorders,
-			clnt_rply->stats.reorder_failures);
-	printf("Server Reorders: %19llu     Reorder Failures: %19llu\n\n", srvr_rply->stats.reorders,
-			srvr_rply->stats.reorder_failures);
-	if (srvr_rply->stats.client_connected) {
+	printf("Rx Packets:      %19llu  %19llu  %19llu  %19llu\n", clnt_rply->pyld.rply.stats.nf_rx_pkts[INGRESS_NFQ],
+			clnt_rply->pyld.rply.stats.nf_rx_pkts[EGRESS_NFQ], srvr_rply->pyld.rply.stats.nf_rx_pkts[INGRESS_NFQ],
+			srvr_rply->pyld.rply.stats.nf_rx_pkts[EGRESS_NFQ]);
+	printf("Tx Packets:      %19llu  %19llu  %19llu  %19llu\n", clnt_rply->pyld.rply.stats.nf_tx_pkts[INGRESS_NFQ],
+			clnt_rply->pyld.rply.stats.nf_tx_pkts[EGRESS_NFQ], srvr_rply->pyld.rply.stats.nf_tx_pkts[INGRESS_NFQ],
+			srvr_rply->pyld.rply.stats.nf_tx_pkts[EGRESS_NFQ]);
+	printf("Rx Bytes:        %19llu  %19llu  %19llu  %19llu\n", clnt_rply->pyld.rply.stats.nf_rx_bytes[INGRESS_NFQ],
+			clnt_rply->pyld.rply.stats.nf_rx_bytes[EGRESS_NFQ], srvr_rply->pyld.rply.stats.nf_rx_bytes[INGRESS_NFQ],
+			srvr_rply->pyld.rply.stats.nf_rx_bytes[EGRESS_NFQ]);
+	printf("Tx Bytes:        %19llu  %19llu  %19llu  %19llu\n", clnt_rply->pyld.rply.stats.nf_tx_bytes[INGRESS_NFQ],
+			clnt_rply->pyld.rply.stats.nf_tx_bytes[EGRESS_NFQ], srvr_rply->pyld.rply.stats.nf_tx_bytes[INGRESS_NFQ],
+			srvr_rply->pyld.rply.stats.nf_tx_bytes[EGRESS_NFQ]);
+	printf("Dropped:         %19llu  %19llu  %19llu  %19llu\n", clnt_rply->pyld.rply.stats.nf_dropped_pkts[INGRESS_NFQ],
+			clnt_rply->pyld.rply.stats.nf_dropped_pkts[EGRESS_NFQ], srvr_rply->pyld.rply.stats.nf_dropped_pkts[INGRESS_NFQ],
+			srvr_rply->pyld.rply.stats.nf_dropped_pkts[EGRESS_NFQ]);
+	printf("Dropped (ratio): %19llu  %19llu  %19llu  %19llu\n", clnt_rply->pyld.rply.stats.nf_dropped_pkts_ratio[INGRESS_NFQ],
+			clnt_rply->pyld.rply.stats.nf_dropped_pkts_ratio[EGRESS_NFQ], srvr_rply->pyld.rply.stats.nf_dropped_pkts_ratio[INGRESS_NFQ],
+			srvr_rply->pyld.rply.stats.nf_dropped_pkts_ratio[EGRESS_NFQ]);
+	printf("Dropped (proto): %19llu  %19llu  %19llu  %19llu\n", clnt_rply->pyld.rply.stats.nf_dropped_pkts_proto[INGRESS_NFQ],
+			clnt_rply->pyld.rply.stats.nf_dropped_pkts_proto[EGRESS_NFQ], srvr_rply->pyld.rply.stats.nf_dropped_pkts_proto[INGRESS_NFQ],
+			srvr_rply->pyld.rply.stats.nf_dropped_pkts_proto[EGRESS_NFQ]);
+	printf("Dropped (qctl):  %19llu  %19llu  %19llu  %19llu\n", clnt_rply->pyld.rply.stats.nf_dropped_pkts_qcontrol[INGRESS_NFQ],
+			clnt_rply->pyld.rply.stats.nf_dropped_pkts_qcontrol[EGRESS_NFQ], srvr_rply->pyld.rply.stats.nf_dropped_pkts_qcontrol[INGRESS_NFQ],
+			srvr_rply->pyld.rply.stats.nf_dropped_pkts_qcontrol[EGRESS_NFQ]);
+	printf("Dropped (space): %19llu  %19llu  %19llu  %19llu\n\n", clnt_rply->pyld.rply.stats.nf_dropped_pkts_space[INGRESS_NFQ],
+			clnt_rply->pyld.rply.stats.nf_dropped_pkts_space[EGRESS_NFQ], srvr_rply->pyld.rply.stats.nf_dropped_pkts_space[INGRESS_NFQ],
+			srvr_rply->pyld.rply.stats.nf_dropped_pkts_space[EGRESS_NFQ]);
+	printf("Client Reorders: %19llu     Reorder Failures: %19llu\n", clnt_rply->pyld.rply.stats.reorders,
+			clnt_rply->pyld.rply.stats.reorder_failures);
+	printf("Server Reorders: %19llu     Reorder Failures: %19llu\n\n", srvr_rply->pyld.rply.stats.reorders,
+			srvr_rply->pyld.rply.stats.reorder_failures);
+	if (srvr_rply->pyld.rply.stats.client_connected) {
 		if (ipv6_mode) {
-			addr6 = (struct sockaddr_in6 *) &srvr_rply->stats.client_sa[0];
+			addr6 = (struct sockaddr_in6 *) &srvr_rply->pyld.rply.stats.client_sa[0];
 			inet_ntop(AF_INET6, &addr6->sin6_addr, client_ip_str[0], INET6_ADDRSTRLEN);
-			addr6 = (struct sockaddr_in6 *) &srvr_rply->stats.client_sa[EGRESS_IF+1];
+			addr6 = (struct sockaddr_in6 *) &srvr_rply->pyld.rply.stats.client_sa[EGRESS_IF+1];
 			inet_ntop(AF_INET6, &addr6->sin6_addr, client_ip_str[EGRESS_IF+1], INET6_ADDRSTRLEN);
 		} else {
-			addr4 = (struct sockaddr_in *) &srvr_rply->stats.client_sa[0];
+			addr4 = (struct sockaddr_in *) &srvr_rply->pyld.rply.stats.client_sa[0];
 			inet_ntop(AF_INET, &addr4->sin_addr, client_ip_str[0], INET_ADDRSTRLEN);
-			addr4 = (struct sockaddr_in *) &srvr_rply->stats.client_sa[EGRESS_IF+1];
+			addr4 = (struct sockaddr_in *) &srvr_rply->pyld.rply.stats.client_sa[EGRESS_IF+1];
 			inet_ntop(AF_INET, &addr4->sin_addr, client_ip_str[EGRESS_IF+1], INET_ADDRSTRLEN);
 		}
 		printf("Client is connected to server on %s and %s.\n", client_ip_str[0], client_ip_str[1]);
@@ -238,18 +238,17 @@ static void print_all_stats(unsigned int iter)
     bool                    keep_going=true;
     fd_set                  set;
     struct timeval          timeout;
-    int                     rc, bytecnt;
-    struct comms_query_s    clntqry, srvrqry;
-    struct comms_reply_s    clntrply, srvrrply;
-    char                    c, *clntqry_c=(char *) &clntqry, *srvrqry_c=(char*) &srvrqry;
-    char                    *clntrply_c=(char *) &clntrply, *srvrrply_c=(char*) &srvrrply;
+    int                     rc;
+    struct comms_packet_s   clntqry, srvrqry;
+    struct comms_packet_s   clntrply, srvrrply;
+    char                    c;
     struct termios          ctrl;
     struct statistics_s     zero_stats;
 
-    clntqry.cmd         = COMMS_GETSTATS;
-    clntqry.for_peer    = false;
-    srvrqry.cmd         = COMMS_GETSTATS;
-    srvrqry.for_peer    = true;
+    clntqry.cmd         		= COMMS_GETSTATS;
+    clntqry.pyld.qry.for_peer   = false;
+    srvrqry.cmd         		= COMMS_GETSTATS;
+    srvrqry.pyld.qry.for_peer	= true;
     memset(&zero_stats, 0, sizeof(struct statistics_s));
 
     tcgetattr(STDIN_FILENO, &ctrl);
@@ -257,41 +256,13 @@ static void print_all_stats(unsigned int iter)
     tcsetattr(STDIN_FILENO, TCSANOW, &ctrl);
 
     do {
-        bytecnt = 0;
-        do {
-            if ((rc = send(comms_serv_fd, &clntqry_c[bytecnt], sizeof(struct comms_query_s)-bytecnt, 0)) == -1) {
-                printf("Error sending request to local instance - %s", strerror(errno));
-                continue;
-            }
-            bytecnt += rc;
-        } while (bytecnt < sizeof(struct comms_query_s));
-        bytecnt = 0;
-        do {
-            if ((rc = recv(comms_serv_fd, &clntrply_c[bytecnt], sizeof(struct comms_reply_s)-bytecnt, 0)) == -1) {
-                printf("Error receiving reply from local instance - %s", strerror(errno));
-                continue;
-            }
-            bytecnt += rc;
-        } while (bytecnt < sizeof(struct comms_reply_s));
-        bytecnt = 0;
-        do {
-            if ((rc = send(comms_serv_fd, &srvrqry_c[bytecnt], sizeof(struct comms_query_s)-bytecnt, 0)) == -1) {
-                printf("Error sending request to remote instance - %s", strerror(errno));
-                continue;
-            }
-            bytecnt += rc;
-        } while (bytecnt < sizeof(struct comms_query_s));
-        bytecnt = 0;
-        do {
-            if ((rc = recv(comms_serv_fd, &srvrrply_c[bytecnt], sizeof(struct comms_reply_s)-bytecnt, 0)) == -1) {
-                printf("Error receiving reply from remote instance - %s", strerror(errno));
-                continue;
-            }
-            bytecnt += rc;
-        } while (bytecnt < sizeof(struct comms_reply_s));
+        send_comms_pkt(comms_serv_fd, &clntqry, sizeof(struct comms_packet_s));
+        recv_comms_pkt(comms_serv_fd, &clntrply, sizeof(struct comms_packet_s));
+        send_comms_pkt(comms_serv_fd, &srvrqry, sizeof(struct comms_packet_s));
+        recv_comms_pkt(comms_serv_fd, &srvrrply, sizeof(struct comms_packet_s));
         printf("%s%s", clr, topLeft); // Clear screen and move to top left
-        if (clntrply.rc != 0) memcpy(&clntrply.stats, &zero_stats, sizeof(struct statistics_s));
-        if (srvrrply.rc != 0) memcpy(&srvrrply.stats, &zero_stats, sizeof(struct statistics_s));
+        if (clntrply.pyld.rply.rc != 0) memcpy(&clntrply.pyld.rply.stats, &zero_stats, sizeof(struct statistics_s));
+        if (srvrrply.pyld.rply.rc != 0) memcpy(&srvrrply.pyld.rply.stats, &zero_stats, sizeof(struct statistics_s));
         print_stats(&clntrply, &srvrrply);
         timeout.tv_sec      = print_stats_delay;
         timeout.tv_usec     = 0;
@@ -318,13 +289,13 @@ static void print_all_stats(unsigned int iter)
 // +----------------------------------------------------------------------------
 static void kill_daemons(void)
 {
-    struct comms_query_s qry;
+    struct comms_packet_s qry;
 
-    qry.cmd         = COMMS_KILL;
-    qry.for_peer  = true;
-    send(comms_serv_fd, &qry, sizeof(struct comms_query_s), 0);
-    qry.for_peer  = false;
-    send(comms_serv_fd, &qry, sizeof(struct comms_query_s), 0);
+    qry.cmd         		= COMMS_KILL;
+    qry.pyld.qry.for_peer   = true;
+    send_comms_pkt(comms_serv_fd, &qry, sizeof(struct comms_packet_s));
+    qry.pyld.qry.for_peer   = false;
+    send_comms_pkt(comms_serv_fd, &qry, sizeof(struct comms_packet_s));
 }
 
 
@@ -332,14 +303,14 @@ static void kill_daemons(void)
 // +----------------------------------------------------------------------------
 static void send_qcontrol(char *command)
 {
-    struct comms_query_s qry;
-    struct comms_reply_s rply;
+    struct comms_packet_s qry;
+    struct comms_packet_s rply;
 
-    sscanf(&command[9], "%d %d", &qry.q_control_index, &qry.q_control_cnt);
-    qry.cmd         = COMMS_SET_QCONTROL;
-    qry.for_peer    = false;
-    send(comms_serv_fd, &qry, sizeof(struct comms_query_s), 0);
-    recv(comms_serv_fd, &rply, sizeof(struct comms_reply_s), 0);
+    sscanf(&command[9], "%d %d", &qry.pyld.qry.q_control_index, &qry.pyld.qry.q_control_cnt);
+    qry.cmd         		= COMMS_SET_QCONTROL;
+    qry.pyld.qry.for_peer   = false;
+    send_comms_pkt(comms_serv_fd, &qry, sizeof(struct comms_packet_s));
+    recv_comms_pkt(comms_serv_fd, &rply, sizeof(struct comms_packet_s));
 }
 
 
@@ -352,7 +323,7 @@ int main(int argc, char *argv[])
     unsigned int            iter=0;
     char                    hostname[256], command[4096];
     bool                    keep_going=true;
-    struct comms_query_s    qry;
+    struct comms_packet_s   qry;
     char                    ipaddr[INET6_ADDRSTRLEN];
 
     memset(hostname, 0, 256);
@@ -426,9 +397,9 @@ int main(int argc, char *argv[])
             print_all_stats(0);
         }
         if (strncmp(command, "exit", 4) == 0) {
-            qry.cmd         = COMMS_EXIT;
-            qry.for_peer  = false;
-            send(comms_serv_fd, &qry, sizeof(struct comms_query_s), 0);
+            qry.cmd         		= COMMS_EXIT;
+            qry.pyld.qry.for_peer   = false;
+            send_comms_pkt(comms_serv_fd, &qry, sizeof(struct comms_packet_s));
             close(comms_serv_fd);
             exit(0);
         }

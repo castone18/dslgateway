@@ -909,7 +909,7 @@ int main(int argc, char *argv[])
     client_query.pyld.qry.for_peer              = false;
     client_query.pyld.qry.helo_data.ipv6_mode   = ipv6_mode;
     client_query.cmd                        	= COMMS_HELO;
-    send(comms_peer_fd, &client_query, sizeof(struct comms_query_s), 0);
+    send_comms_pkt(comms_peer_fd, &client_query, sizeof(struct comms_packet_s));
     while((rc = recv(comms_peer_fd, &client_response, sizeof(struct comms_reply_s), 0) == -1) && (errno == EINTR));
     if (rc == -1) {
         rc = errno;

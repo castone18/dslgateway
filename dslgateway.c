@@ -127,7 +127,6 @@ static struct sockaddr_in       *client_addr4[NUM_EGRESS_INTERFACES] = {(struct 
 static bool                     debug=false;
 static char                     config_file_name[PATH_MAX];
 static bool                     q_control_on=false;
-static char                     *comms_name=NULL;
 static unsigned int             cc_port=PORT;
 
 
@@ -462,15 +461,6 @@ static void read_config_file(void)
         if_config[i].if_port = config_setting_get_int_elem(config_list, i);
         log_msg(LOG_INFO, "Configured for data port on %u.\n", if_config[i].if_port);
     }
-    config_string = NULL;
-    if (config_lookup_string(&cfg, "comms_name", &config_string)) {
-        if ((comms_name = malloc(strlen(config_string)+1)) == NULL) {
-            log_msg(LOG_ERR, "%s-%d: Out of memory.\n", __FUNCTION__, __LINE__);
-            exit(ENOMEM);
-        }
-        strcpy(comms_name, config_string);
-        log_msg(LOG_INFO, "Configured for comms on %s.\n", comms_name);
-    }
     if (config_lookup_int(&cfg, "server.egress.nf_q_no", &nfq_config[EGRESS_NFQ].nfq_q_no)) {
         log_msg(LOG_INFO, "Configured for egress netfilter queue on %u.\n", nfq_config[EGRESS_NFQ].nfq_q_no);
     }
@@ -693,7 +683,7 @@ int main(int argc, char *argv[])
     struct sigaction            sigact;
     struct sched_param          sparam;
     char                        ipaddr[INET6_ADDRSTRLEN];
-    fd_set                        readset;
+    fd_set                      readset;
     bool                        keep_going=true;
 
     i=0;
@@ -774,12 +764,6 @@ int main(int argc, char *argv[])
 
     // configure this instance of the program
     read_config_file();
-
-    // do some sanity checks
-    if ((comms_name == NULL) || (strlen(comms_name) == 0)) {
-        log_msg(LOG_ERR, "You must provide a comms ip or dns name in config file.\n\n");
-        exit(EINVAL);
-    }
 
     if (egresscnt == 0) {
         log_msg(LOG_ERR, "You must provide an ingress/egress interface name in the config file.\n\n");

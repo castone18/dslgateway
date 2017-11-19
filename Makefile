@@ -5,8 +5,8 @@ all: dslserver dslclient dslui
 dslserver: dslgateway.o dslgateway_common.o log.o util.o
 	gcc -g -pthread -o $@ $^ -lconfig -lnetfilter_queue
 	
-dslui: dslgateway_ui.o log.o util.o
-	gcc -g -pthread -o $@ $^ -lconfig 
+dslui: dslgateway_ui.o log.o util.o dslgateway_common.o
+	gcc -g -pthread -o $@ $^ -lconfig -lnetfilter_queue
 	
 dslclient: dslgateway_client.o dslgateway_common.o log.o util.o
 	gcc -g -pthread -o $@ $^ -lconfig -lrt -lnetfilter_queue
