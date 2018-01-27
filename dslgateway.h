@@ -92,16 +92,16 @@ struct comms_thread_parms_s {
 };
 
 struct if_config_s {
-    int                     if_fd;
-    int						if_peer_fd;
-    uint32_t				if_port;
-    char                    if_name[IFNAMSIZ];
-    struct sockaddr_storage if_ipaddr;
-    uint8_t                 if_ratio;
-    int						if_index;
-    uint32_t				if_fwmark;
-    struct sockaddr_in6     if_peer_client_addr6;
-    struct sockaddr_in      if_peer_client_addr;
+    int                     if_fd;                 // fd of the file descriptor for the data port
+    int						if_peer_fd;            // when client connects to data port, this is the fd
+    uint32_t				if_port;               // data port number
+    char                    if_name[IFNAMSIZ];     // name of ingress/egress interface(s)
+    struct sockaddr_storage if_ipaddr;             // ip address of client
+    uint8_t                 if_ratio;              // speed weighting of this interface
+    int						if_index;              // kernel if index of this interfacxe
+    uint32_t				if_fwmark;             // netfilter fwmark for this interface
+    struct sockaddr_in6     if_peer_client_addr6;  // ip address of peer
+    struct sockaddr_in      if_peer_client_addr;   // ip address of peer
     socklen_t               if_sin_size;
     uint32_t				if_train_cnt;
     struct timespec			if_diff;
@@ -140,4 +140,3 @@ int recv_comms_pkt(int fd, void *buf, size_t len);
 #endif
 
 #endif /* DSLGATEWAY_H */
-

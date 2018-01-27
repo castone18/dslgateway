@@ -128,6 +128,7 @@ static bool                     debug=false;
 static char                     config_file_name[PATH_MAX];
 static bool                     q_control_on=false;
 static unsigned int             cc_port=PORT;
+static unsigned int             data_port_cnt=0;
 
 
 //// +----------------------------------------------------------------------------
@@ -456,6 +457,7 @@ static void read_config_file(void)
         log_msg(LOG_INFO, "Configured for debugging queue control %s.\n", q_control_on ? "on" : "off");
     }
     config_list = config_lookup(&cfg, "data_port");
+    data_port_cnt = config_setting_length(config_list);
     for (i=0; i<config_setting_length(config_list); i++) {
         if (i == NUM_NETFILTER_QUEUES) break;
         if_config[i].if_port = config_setting_get_int_elem(config_list, i);
@@ -574,14 +576,14 @@ static void open_data_ports(void)
     int             i, rc;
     struct ifreq    ifr;
 
-    for (i=0; i<egresscnt; i++) {
+    for (i=0; i<data_port_cnt; i++) {
         // Open socket for egress tx interface.
         if ((if_config[i].if_fd = create_channel(if_config[i].if_port)) < 0) {
             exit_level1_cleanup();
             exit(-1*if_config[i].if_fd);
         }
         memset(&ifr, 0, sizeof(ifr));
-        strncpy(ifr.ifr_name, if_config[i].if_name, sizeof(ifr.ifr_name));
+        strncpy(ifr.ifr_name, if_config[EGRESS_IF].if_name, sizeof(ifr.ifr_name));
         // Get interface if index
         if (ioctl (if_config[i].if_fd, SIOCGIFINDEX, &ifr) < 0) {
             rc = errno;
@@ -855,33 +857,39 @@ int main(int argc, char *argv[])
     for (;;) {
         log_msg(LOG_INFO, "Waiting for data port connections.\n");
         // Accept the data port connections
+        if_config[EGRESS_IF].if_peer_fd = -1;
+        if_config[EGRESS_IF+1].if_peer_fd = -1;
         for (i=0; i<NUM_EGRESS_INTERFACES; i++) {
-            if (ipv6_mode) {
-                if_config[i].if_sin_size = sizeof(if_config[i].if_peer_client_addr6);
-                if ((if_config[i].if_peer_fd = accept(if_config[i].if_fd, (struct sockaddr *)&if_config[i].if_peer_client_addr6, &if_config[i].if_sin_size)) < 0) {
-                    log_msg(LOG_ERR, "%s-%d: Error accepting peer data connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-                    continue;
+            while (if_config[i].if_peer_fd < 0) {
+                if (ipv6_mode) {
+                    if_config[i].if_sin_size = sizeof(if_config[i].if_peer_client_addr6);
+                    if ((if_config[i].if_peer_fd = accept(if_config[i].if_fd, (struct sockaddr *)&if_config[i].if_peer_client_addr6, &if_config[i].if_sin_size)) < 0) {
+                        log_msg(LOG_ERR, "%s-%d: Error accepting peer data connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+                        continue;
+                    }
+                    inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&if_config[i].if_peer_client_addr6), ipaddr, sizeof ipaddr);
+                    if (memcmp(&if_config[i].if_peer_client_addr6.sin6_addr, &client_addr6[i]->sin6_addr, sizeof(struct in6_addr)) != 0) {
+                        log_msg(LOG_INFO, "Closing connection from unknown host %s.\n", ipaddr);
+                        close(if_config[i].if_peer_fd);
+                        if_config[i].if_peer_fd = -1;
+                        continue;
+                    }
+                    log_msg(LOG_INFO, "Accepted peer data connection from %s on port %u.\n", ipaddr, if_config[i].if_port);
+                } else {
+                    if_config[i].if_sin_size = sizeof(if_config[i].if_peer_client_addr);
+                    if ((if_config[i].if_peer_fd = accept(if_config[i].if_fd, (struct sockaddr *)&if_config[i].if_peer_client_addr, &if_config[i].if_sin_size)) < 0) {
+                        log_msg(LOG_ERR, "%s-%d: Error accepting peer data connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+                        continue;
+                    }
+                    inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&if_config[i].if_peer_client_addr), ipaddr, sizeof ipaddr);
+                    if (if_config[i].if_peer_client_addr.sin_addr.s_addr != client_addr4[i]->sin_addr.s_addr) {
+                        log_msg(LOG_INFO, "Closing connection from unknown host %s.\n", ipaddr);
+                        close(if_config[i].if_peer_fd);
+                        if_config[i].if_peer_fd = -1;
+                        continue;
+                    }
+                    log_msg(LOG_INFO, "Accepted peer data connection from %s on port %u.\n", ipaddr, if_config[i].if_port);
                 }
-                inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&if_config[i].if_peer_client_addr6), ipaddr, sizeof ipaddr);
-                if (memcmp(&if_config[i].if_peer_client_addr6.sin6_addr, &client_addr6[i]->sin6_addr, sizeof(struct in6_addr)) != 0) {
-                    log_msg(LOG_INFO, "Closing connection from unknown host %s.\n", ipaddr);
-                    close(if_config[i].if_peer_fd);
-                    continue;
-                }
-                log_msg(LOG_INFO, "Accepted peer data connection from %s on port %u.\n", ipaddr, if_config[i].if_port);
-            } else {
-                if_config[i].if_sin_size = sizeof(if_config[i].if_peer_client_addr);
-                if ((if_config[i].if_peer_fd = accept(if_config[i].if_fd, (struct sockaddr *)&if_config[i].if_peer_client_addr, &if_config[i].if_sin_size)) < 0) {
-                    log_msg(LOG_ERR, "%s-%d: Error accepting peer data connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-                    continue;
-                }
-                inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&if_config[i].if_peer_client_addr), ipaddr, sizeof ipaddr);
-                if (if_config[i].if_peer_client_addr.sin_addr.s_addr != client_addr4[i]->sin_addr.s_addr) {
-                    log_msg(LOG_INFO, "Closing connection from unknown host %s.\n", ipaddr);
-                    close(if_config[i].if_peer_fd);
-                    continue;
-                }
-                log_msg(LOG_INFO, "Accepted peer data connection from %s on port %u.\n", ipaddr, if_config[i].if_port);
             }
         }
 

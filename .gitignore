@@ -8,3 +8,5 @@ nbproject/
 .cproject
 .project
 .settings/
+cscope.*
+tags

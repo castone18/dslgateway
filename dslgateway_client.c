@@ -931,8 +931,8 @@ int main(int argc, char *argv[])
     }
 
     for (;;) {
-        log_msg(LOG_INFO, "Waiting for data port connections.\n");
-        // Accept the data port connections
+        log_msg(LOG_INFO, "Connecting to server on data ports.\n");
+        // Connect to server on data port
         for (i=0; i<NUM_EGRESS_INTERFACES; i++) {
             if (ipv6_mode) {
                 if_config[i].if_sin_size = sizeof(if_config[i].if_peer_client_addr6);
