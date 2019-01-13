@@ -17,7 +17,7 @@
 // |
 // +----------------------------------------------------------------------------
 // |
-// | dslgateway.c
+// | dslgateway_client.c
 // |
 // |    This file is part of a dsl gateway that splits outgoing IP traffic between
 // | two DSL lines. See dslgateway.c for an explanation of the features and intent
@@ -75,10 +75,10 @@
 extern char                     *progname;
 extern struct if_config_s       if_config[NUM_EGRESS_INTERFACES];
 extern struct nf_queue_config_s nfq_config[NUM_NETFILTER_QUEUES];
-extern unsigned int             egresscnt;
 extern struct statistics_s      nf_stats;
 extern int                      thread_exit_rc;
 extern bool                     ipv6_mode;
+extern unsigned int             cc_port;
 extern void                     (*exit_level2_cleanup)(void);
 extern void                     (*handle_comms_command)(struct comms_packet_s *query, struct comms_packet_s *reply,
                                     int comms_client_fd, bool *connection_active);
@@ -95,7 +95,6 @@ static bool                     debug=false;
 static char                     config_file_name[PATH_MAX];
 static char                     *remote_name=NULL;
 static int                      comms_peer_fd=-1;
-static unsigned int             cc_port=PORT;
 static bool                     comms_addr_valid=false;
 static char                     *comms_name=NULL;
 static bool                     q_control_on=false;
@@ -522,6 +521,7 @@ static void read_config_file(void)
         if (i == 6) ipv6_mode = true;
         log_msg(LOG_INFO, "Configured for %s.\n", ipv6_mode ? "ipv6" : "ipv4");
     }
+    nf_stats.ipv6_mode      = ipv6_mode;
     if (config_lookup_bool(&cfg, "qcontrol", &i)) {
         q_control_on = i;
         log_msg(LOG_INFO, "Configured for debugging queue control %s.\n", q_control_on ? "on" : "off");
@@ -550,24 +550,24 @@ static void read_config_file(void)
         strcpy(remote_name, config_string);
         log_msg(LOG_INFO, "Configured for server name %s.\n", remote_name);
     }
-    config_list = config_lookup(&cfg, "client.egress.interface");
-    for (i=0; i<config_setting_length(config_list); i++) {
-        if (i == NUM_EGRESS_INTERFACES) break;
-        egresscnt++;
-        strcpy(if_config[i].if_name, config_setting_get_string_elem(config_list, i));
-        log_msg(LOG_INFO, "Configured for client egress interface on %s.\n", if_config[i].if_name);
+    config_string = NULL;
+    if (config_lookup_string(&cfg, "client.egress.interface", &config_string)) {
+        for (i = 0; i < NUM_EGRESS_INTERFACES; i++) {
+            strcpy(if_config[i].if_name, config_string);
+        }
+        log_msg(LOG_INFO, "Configured for egress interface %s.\n", config_string);
     }
     config_list = config_lookup(&cfg, "client.egress.ratio");
     for (i=0; i<config_setting_length(config_list); i++) {
-        if (i == egresscnt) break;
+        if (i == NUM_EGRESS_INTERFACES) break;
         if_config[i].if_ratio = config_setting_get_int_elem(config_list, i);
-        log_msg(LOG_INFO, "Configured for client egress interface ratio of %u on %s.\n", if_config[i].if_ratio, if_config[i].if_name);
+        log_msg(LOG_INFO, "Configured for client egress interface ratio of %u on port %u.\n", if_config[i].if_ratio, if_config[i].if_port);
     }
     config_list = config_lookup(&cfg, "client.egress.fwmark");
     for (i=0; i<config_setting_length(config_list); i++) {
-        if (i == egresscnt) break;
+        if (i == NUM_EGRESS_INTERFACES) break;
         if_config[i].if_fwmark = config_setting_get_int_elem(config_list, i);
-        log_msg(LOG_INFO, "Configured for client egress interface fwmark of %u on %s.\n", if_config[i].if_fwmark, if_config[i].if_name);
+        log_msg(LOG_INFO, "Configured for client egress interface fwmark of %u on port %u.\n", if_config[i].if_fwmark, if_config[i].if_port);
     }
     if (config_lookup_int(&cfg, "client.egress.nf_q_no", &nfq_config[EGRESS_NFQ].nfq_q_no)) {
         log_msg(LOG_INFO, "Configured for egress netfilter queue on %u.\n", nfq_config[EGRESS_NFQ].nfq_q_no);
@@ -584,23 +584,51 @@ static void read_config_file(void)
 // | Process packets from server received on the two data port connections. This
 // | function calculates the transmission times on each of the egress interfaces.
 // +----------------------------------------------------------------------------
-static bool process_data_port_packet(int fd, int ifindex)
+static bool process_data_port_packet(void)
 {
-    struct data_port_ping_s        data_port_ping;
+    struct data_port_ping_s        dpp0, dpp1;
     int                            rc;
+    struct timespec                ts_peer_diff, ts_ping_diff, ts_trans_time;
 
-    while (((rc = recv(fd, &data_port_ping, sizeof(data_port_ping), 0)) == -1) && (errno == EINTR));
+    rc = recv_pkt(if_config[EGRESS_IF].if_peer_fd, &dpp0, sizeof(struct data_port_ping_s), MSG_WAITALL);
+    clock_gettime(CLOCK_MONOTONIC, &if_config[EGRESS_IF].if_ping_ts); 
     if (rc == 0) {
         log_msg(LOG_WARNING, "Closing data port connections.\n");
         close(if_config[EGRESS_IF].if_peer_fd);
         close(if_config[EGRESS_IF+1].if_peer_fd);
         return false;
-    }
-    if (rc > 0) {
-        if (rc != sizeof(data_port_ping)) {
-            log_msg(LOG_INFO, "Data port packet dropped - invalid size %d.\n", rc);
+    } else if (rc > 0) {
+        rc = recv_pkt(if_config[EGRESS_IF+1].if_peer_fd, &dpp1, sizeof(struct data_port_ping_s), MSG_WAITALL);
+        clock_gettime(CLOCK_MONOTONIC, &if_config[EGRESS_IF+1].if_ping_ts); 
+        log_debug_msg(LOG_INFO, "Received data port packets.\n"); 
+        if (rc == 0) {
+            log_msg(LOG_WARNING, "Closing data port connections.\n");
+            close(if_config[EGRESS_IF].if_peer_fd);
+            close(if_config[EGRESS_IF+1].if_peer_fd);
+            return false;
+        } else if (rc > 0) {
+            if_config[EGRESS_IF].if_peer_ts.tv_sec = dpp0.ts_sec;
+            if_config[EGRESS_IF].if_peer_ts.tv_nsec = dpp0.ts_nsec;
+            if_config[EGRESS_IF+1].if_peer_ts.tv_sec = dpp1.ts_sec;
+            if_config[EGRESS_IF+1].if_peer_ts.tv_nsec = dpp1.ts_nsec;
+            // Compute the difference in time between ping sends on the server
+            ts_peer_diff = subtract_ts(&if_config[EGRESS_IF+1].if_peer_ts, &if_config[EGRESS_IF].if_peer_ts);
+            // Compute the difference in ping receive times
+            ts_ping_diff = subtract_ts(&if_config[EGRESS_IF+1].if_ping_ts, &if_config[EGRESS_IF].if_ping_ts);
+            // Compute the difference in transmission time
+            ts_trans_time = subtract_ts(&ts_ping_diff, &ts_peer_diff);
+            dpp0.ts_sec   = ts_trans_time.tv_sec;
+            dpp0.ts_nsec  = ts_trans_time.tv_nsec;
+            strncpy(dpp0.cmd, "pingr", 6);
+            if ((rc = send_pkt(if_config[EGRESS_IF].if_peer_fd, &dpp0, sizeof(struct data_port_ping_s))) < sizeof(struct data_port_ping_s)) {
+                log_debug_msg(LOG_ERR, "%s:%d: Error in send_pkt, rc=%d, expected %d.\n", __FUNCTION__, __LINE__, rc, sizeof(struct data_port_ping_s));
+            }
+            dpp0.intf = EGRESS_IF+1;
+            if ((rc = send_pkt(if_config[EGRESS_IF+1].if_peer_fd, &dpp0, sizeof(struct data_port_ping_s))) < sizeof(struct data_port_ping_s)) {
+                log_debug_msg(LOG_ERR, "%s:%d: Error in send_pkt, rc=%d, expected %d.\n", __FUNCTION__, __LINE__, rc, sizeof(struct data_port_ping_s));
+            }
         } else {
-            log_msg(LOG_INFO, "Received data port packet from port %u.\n", if_config[ifindex].if_port);
+            log_msg(LOG_WARNING, "Data port receive returns %s.\n", strerror(errno));
         }
     } else {
         log_msg(LOG_WARNING, "Data port receive returns %s.\n", strerror(errno));
@@ -610,15 +638,61 @@ static bool process_data_port_packet(int fd, int ifindex)
 
 
 // +----------------------------------------------------------------------------
-// | Open a socket and connect to peer
+// | Open a socket and connect to comms on peer
 // +----------------------------------------------------------------------------
-static int connect_to_server(struct sockaddr_storage *addr, socklen_t addr_sz, sa_family_t ip_family) {
+static int connect_to_comms_server(struct sockaddr_storage *addr, socklen_t addr_sz, sa_family_t ip_family)
+{
     int            rc, fd;
 
     if ((fd = socket(ip_family, SOCK_STREAM, 0)) < 0) {
         rc = -1*errno;
         log_msg(LOG_ERR, "%s-%d: Can not create socket - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
         return rc;
+    }
+
+    if (connect(fd, (struct sockaddr *) addr, addr_sz) < 0) {
+        rc = -1*errno;
+        log_msg(LOG_ERR, "%s-%d: Not connected - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+        return rc;
+    }
+
+    return fd;
+}
+
+
+// +----------------------------------------------------------------------------
+// | Open a socket and connect to data port on peer
+// +----------------------------------------------------------------------------
+static int connect_to_data_server(struct sockaddr_storage *addr, socklen_t addr_sz, sa_family_t ip_family, int intf)
+{
+    int            rc, fd, fwmark;
+    const int      *fwmark_ptr = &fwmark;
+    struct ifreq   ifr;
+
+    if ((fd = socket(ip_family, SOCK_STREAM, 0)) < 0) {
+        rc = -1*errno;
+        log_msg(LOG_ERR, "%s-%d: Can not create socket - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+        return rc;
+    }
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, if_config[intf].if_name, sizeof(ifr.ifr_name));
+    // Get interface if index
+    if (ioctl (fd, SIOCGIFINDEX, &ifr) < 0) {
+        log_msg(LOG_ERR, "%s-%d: Can not get interface index for %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
+    } else {
+        // Bind socket to a particular interface name (eg: ppp0 or ppp1)
+        if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, (void *)&ifr, sizeof(ifr)) < 0) {
+            log_msg(LOG_ERR, "Can not bind socket to %s - %s.\n", ifr.ifr_name, strerror(errno)); 
+        } else {
+            log_debug_msg(LOG_INFO, "Interface %d bound to %s.\n", intf, ifr.ifr_name); 
+        }
+    }
+    /* setting socket option to use fwmark value */
+    fwmark = intf+1;
+    if (setsockopt (fd, SOL_SOCKET, SO_MARK, fwmark_ptr, sizeof (int)) < 0)
+    {
+        log_msg(LOG_ERR, "Error setting fwmark on socket - %s.\n", strerror(errno));
     }
 
     if (connect(fd, (struct sockaddr *) addr, addr_sz) < 0) {
@@ -647,9 +721,9 @@ static int reconnect_comms_to_server(void)
             return -EINVAL;
         }
         comms_addr6.sin6_port       = htons((unsigned short)cc_port);
-        log_msg(LOG_INFO, "Waiting for connection to server %s on port %u...", comms_name, cc_port);
-        if ((comms_peer_fd = connect_to_server((struct sockaddr_storage *) &comms_addr6, sizeof(comms_addr6), AF_INET6)) < 0) {
-            log_msg(LOG_INFO, "Not connected.\n");
+        log_debug_msg(LOG_INFO, "Waiting for connection to server %s on port %u...", comms_name, cc_port);
+        if ((comms_peer_fd = connect_to_comms_server((struct sockaddr_storage *) &comms_addr6, sizeof(comms_addr6), AF_INET6)) < 0) {
+            log_debug_msg(LOG_INFO, "Not connected.\n");
             return comms_peer_fd;
         }
     } else {
@@ -659,16 +733,83 @@ static int reconnect_comms_to_server(void)
             return -EINVAL;
         }
         comms_addr.sin_port        = htons((unsigned short)cc_port);
-        log_msg(LOG_INFO, "Waiting for connection to server %s on port %u...", comms_name, cc_port);
-        if ((comms_peer_fd = connect_to_server((struct sockaddr_storage *) &comms_addr, sizeof(comms_addr), AF_INET)) < 0) {
-            log_msg(LOG_INFO, "Not connected.\n");
+        log_debug_msg(LOG_INFO, "Waiting for connection to server %s on port %u...", comms_name, cc_port);
+        if ((comms_peer_fd = connect_to_comms_server((struct sockaddr_storage *) &comms_addr, sizeof(comms_addr), AF_INET)) < 0) {
+            log_debug_msg(LOG_INFO, "Not connected.\n");
             return comms_peer_fd;
         }
     }
-    log_msg(LOG_INFO, "Connected.\n");
+    log_debug_msg(LOG_INFO, "Connected.\n");
 
     comms_addr_valid = true;
     return 0;
+}
+
+
+
+// +----------------------------------------------------------------------------
+// | Initialize netfilter queue
+// +----------------------------------------------------------------------------
+void init_netfilter(void)
+{
+    int rc;
+
+    nfq_config[INGRESS_NFQ].nfq_cb                    = &home_to_vps_pkt_mangler_cb;
+    nfq_config[INGRESS_NFQ].nf_index                = INGRESS_NFQ;
+    nfq_config[INGRESS_NFQ].nf_thread.keep_going    = true;
+    if (q_control_on) {
+        nfq_config[INGRESS_NFQ].q_control            = true;
+        nfq_config[INGRESS_NFQ].q_control_cnt        = 0;
+    }
+    else {
+        nfq_config[INGRESS_NFQ].q_control            = false;
+    }
+    if ((nfq_config[INGRESS_NFQ].h = nfq_open()) == NULL) {
+        rc = errno;
+        log_msg(LOG_ERR, "%s-%d: Error opening netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+        exit_level1_cleanup();
+        exit(rc);
+    }
+
+    if (ipv6_mode) {
+        if (nfq_unbind_pf(nfq_config[INGRESS_NFQ].h, AF_INET6) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Error unbinding from netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        }
+        if (nfq_bind_pf(nfq_config[INGRESS_NFQ].h, AF_INET6) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Error binding to netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        }
+    } else {
+        if (nfq_unbind_pf(nfq_config[INGRESS_NFQ].h, AF_INET) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Error unbinding from netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        }
+        if (nfq_bind_pf(nfq_config[INGRESS_NFQ].h, AF_INET) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Error binding to netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        }
+    }
+
+//    nfq_config[EGRESS_NFQ].nfq_cb                    = &home_to_vps_pkt_mangler_cb;
+//    nfq_config[EGRESS_NFQ].nf_index                    = EGRESS_NFQ;
+//    nfq_config[EGRESS_NFQ].nf_thread.keep_going        = true;
+    nfq_config[EGRESS_NFQ].h                        = nfq_config[INGRESS_NFQ].h;
+    if (q_control_on) {
+        nfq_config[EGRESS_NFQ].q_control            = true;
+        nfq_config[EGRESS_NFQ].q_control_cnt        = 0;
+    }
+    else {
+        nfq_config[EGRESS_NFQ].q_control            = false;
+    }
 }
 
 
@@ -677,7 +818,7 @@ static int reconnect_comms_to_server(void)
 // +----------------------------------------------------------------------------
 int main(int argc, char *argv[])
 {
-    int                         option, i, j, rc, readset_fd;
+    int                         option, i, j, rc;
     bool                        daemonize=true, keep_going=true;
     pid_t                       pid, sid;
     struct sigaction            sigact;
@@ -685,8 +826,8 @@ int main(int argc, char *argv[])
 //    struct sigevent             se;
     struct comms_packet_s       client_query;
     struct comms_packet_s       client_response;
-    char                        ipaddr[INET6_ADDRSTRLEN];
     fd_set                      readset;
+    char                        ipaddr[INET6_ADDRSTRLEN];
 
     i=0;
     if (argv[0][0] == '.' || argv[0][0] == '/') i++;
@@ -784,11 +925,6 @@ int main(int argc, char *argv[])
         exit(EINVAL);
     }
 
-    if (egresscnt == 0) {
-        log_msg(LOG_ERR, "You must provide an egress interface name in the config file.\n\n");
-        exit(EINVAL);
-    }
-
     // Switch to real time scheduler
     sparam.sched_priority = sched_get_priority_min(SCHED_RR);
     if (sched_setscheduler(getpid(), SCHED_RR, &sparam) == -1) {
@@ -797,7 +933,7 @@ int main(int argc, char *argv[])
     }
 
     // Get ip addresses of all the egress interfaces
-    //get_ip_addrs();
+    get_ip_addrs();
 
     // Create timer to handle reorder buffer timeouts
 //    se.sigev_notify             = SIGEV_THREAD;
@@ -833,67 +969,12 @@ int main(int argc, char *argv[])
     }
 
     // Start comms thread
-    //process_comms();
+    start_comms();
 
     while ((rc = reconnect_comms_to_server()) != 0) sleep(5);
 
     // Initialize netfilter queue config
-    nfq_config[INGRESS_NFQ].nfq_cb                    = &home_to_vps_pkt_mangler_cb;
-    nfq_config[INGRESS_NFQ].nf_index                = INGRESS_NFQ;
-    nfq_config[INGRESS_NFQ].nf_thread.keep_going    = true;
-    if (q_control_on) {
-        nfq_config[INGRESS_NFQ].q_control            = true;
-        nfq_config[INGRESS_NFQ].q_control_cnt        = 0;
-    }
-    else {
-        nfq_config[INGRESS_NFQ].q_control            = false;
-    }
-    if ((nfq_config[INGRESS_NFQ].h = nfq_open()) == NULL) {
-        rc = errno;
-        log_msg(LOG_ERR, "%s-%d: Error opening netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-        exit_level1_cleanup();
-        exit(rc);
-    }
-
-    if (ipv6_mode) {
-        if (nfq_unbind_pf(nfq_config[INGRESS_NFQ].h, AF_INET6) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Error unbinding from netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-        if (nfq_bind_pf(nfq_config[INGRESS_NFQ].h, AF_INET6) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Error binding to netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-    } else {
-        if (nfq_unbind_pf(nfq_config[INGRESS_NFQ].h, AF_INET) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Error unbinding from netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-        if (nfq_bind_pf(nfq_config[INGRESS_NFQ].h, AF_INET) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Error binding to netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-    }
-
-//    nfq_config[EGRESS_NFQ].nfq_cb                    = &home_to_vps_pkt_mangler_cb;
-//    nfq_config[EGRESS_NFQ].nf_index                    = EGRESS_NFQ;
-//    nfq_config[EGRESS_NFQ].nf_thread.keep_going        = true;
-    nfq_config[EGRESS_NFQ].h                        = nfq_config[INGRESS_NFQ].h;
-    if (q_control_on) {
-        nfq_config[EGRESS_NFQ].q_control            = true;
-        nfq_config[EGRESS_NFQ].q_control_cnt        = 0;
-    }
-    else {
-        nfq_config[EGRESS_NFQ].q_control            = false;
-    }
+    init_netfilter();
 
     // Handshake with server, send helo message and wait for ack.
     if (ipv6_mode) {
@@ -909,8 +990,11 @@ int main(int argc, char *argv[])
     client_query.pyld.qry.for_peer              = false;
     client_query.pyld.qry.helo_data.ipv6_mode   = ipv6_mode;
     client_query.cmd                        	= COMMS_HELO;
-    send_comms_pkt(comms_peer_fd, &client_query, sizeof(struct comms_packet_s));
-    while((rc = recv(comms_peer_fd, &client_response, sizeof(struct comms_reply_s), 0) == -1) && (errno == EINTR));
+    if ((rc = send_pkt(comms_peer_fd, &client_query, sizeof(struct comms_packet_s))) < sizeof(struct comms_packet_s)) {
+        log_debug_msg(LOG_ERR, "%s:%d: Error in send_pkt, rc=%d, expected %d.\n", __FUNCTION__, __LINE__, rc, sizeof(struct comms_packet_s));
+        exit(EFAULT);
+    }
+    rc = recv_pkt(comms_peer_fd, &client_response, sizeof(struct comms_reply_s), MSG_WAITALL);
     if (rc == -1) {
         rc = errno;
         log_msg(LOG_ERR, "%s-%d: Did not receive helo ack - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
@@ -920,9 +1004,8 @@ int main(int argc, char *argv[])
     if (client_response.pyld.rply.rc != 0) {
         log_msg(LOG_ERR, "%s-%d: Did not receive helo ack - rc=%d.\n", __FUNCTION__, __LINE__, client_response.pyld.rply.rc);
     } else {
-        log_msg(LOG_INFO, "Received HELO ack - rc=%d.\n", client_response.pyld.rply.rc);
+        log_debug_msg(LOG_INFO, "Received HELO ack - rc=%d.\n", client_response.pyld.rply.rc);
     }
-    nf_stats.ipv6_mode      = ipv6_mode;
 
     // Start up the client threads
     if (create_threads()) {
@@ -936,45 +1019,35 @@ int main(int argc, char *argv[])
         for (i=0; i<NUM_EGRESS_INTERFACES; i++) {
             if (ipv6_mode) {
                 if_config[i].if_sin_size = sizeof(if_config[i].if_peer_client_addr6);
-                if ((if_config[i].if_peer_fd = accept(if_config[i].if_fd, (struct sockaddr *)&if_config[i].if_peer_client_addr6, &if_config[i].if_sin_size)) < 0) {
-                    log_msg(LOG_ERR, "%s-%d: Error accepting peer data connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-                    continue;
-                }
+                memcpy(&if_config[i].if_peer_client_addr6, &peer_addr6, sizeof(struct sockaddr_in6));
+                if_config[i].if_peer_client_addr6.sin6_port = htons((unsigned short)if_config[i].if_port);
                 inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&if_config[i].if_peer_client_addr6), ipaddr, sizeof ipaddr);
-                if (memcmp(&if_config[i].if_peer_client_addr6.sin6_addr, &peer_addr6.sin6_addr, sizeof(struct in6_addr)) != 0) {
-                    log_msg(LOG_INFO, "Closing connection from unknown host %s.\n", ipaddr);
-                    close(if_config[i].if_peer_fd);
-                    continue;
-                }
-                log_msg(LOG_INFO, "Accepted peer data connection from %s on port %u.\n", ipaddr, if_config[i].if_port);
-                if_config[i].if_peer_client_addr6.sin6_port = if_config[i].if_port;
+                log_debug_msg(LOG_INFO, "Attempting to connect to server %s on data port %d.\n", ipaddr, ntohs(if_config[i].if_peer_client_addr.sin_port));
                 for (j=0; j<5; j++) {
-                    if ((if_config[i].if_peer_fd = connect_to_server((struct sockaddr_storage *)&if_config[i].if_peer_client_addr6, sizeof(struct sockaddr_in6), AF_INET6)) < 0) {
+                    if ((if_config[i].if_peer_fd = connect_to_data_server((struct sockaddr_storage *)&if_config[i].if_peer_client_addr6, sizeof(struct sockaddr_in6), AF_INET6, i)) <= 0) {
+                        log_msg(LOG_ERR, "Error connecting to server %s on data port %d - %s.\n", ipaddr, ntohs(if_config[i].if_peer_client_addr6.sin6_port), strerror(errno));
                         sleep(2);
                         log_msg(LOG_INFO, "Retrying data connection to server.\n");
+                    } else {
+                        log_msg(LOG_INFO, "Connected to server %s on data port %d.\n", ipaddr, ntohs(if_config[i].if_peer_client_addr6.sin6_port));
+                        break;
                     }
-                    else break;
                 }
             } else {
                 if_config[i].if_sin_size = sizeof(if_config[i].if_peer_client_addr);
-                if ((if_config[i].if_peer_fd = accept(if_config[i].if_fd, (struct sockaddr *)&if_config[i].if_peer_client_addr, &if_config[i].if_sin_size)) < 0) {
-                    log_msg(LOG_ERR, "%s-%d: Error accepting peer data connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-                    continue;
-                }
-                inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&if_config[i].if_peer_client_addr), ipaddr, sizeof ipaddr);
-                if (if_config[i].if_peer_client_addr.sin_addr.s_addr != peer_addr.sin_addr.s_addr) {
-                    log_msg(LOG_INFO, "Closing connection from unknown host %s.\n", ipaddr);
-                    close(if_config[i].if_peer_fd);
-                    continue;
-                }
-                log_msg(LOG_INFO, "Accepted peer data connection from %s on port %u.\n", ipaddr, if_config[i].if_port);
-                if_config[i].if_peer_client_addr.sin_port = if_config[i].if_port;
+                memcpy(&if_config[i].if_peer_client_addr, &peer_addr, sizeof(struct sockaddr_in));
+                if_config[i].if_peer_client_addr.sin_port = htons((unsigned short)if_config[i].if_port);
+                inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&if_config[i].if_peer_client_addr), ipaddr, sizeof ipaddr);
+                log_debug_msg(LOG_INFO, "Attempting to connect to server %s on data port %d.\n", ipaddr, ntohs(if_config[i].if_peer_client_addr.sin_port));
                 for (j=0; j<5; j++) {
-                    if ((if_config[i].if_peer_fd = connect_to_server((struct sockaddr_storage *)&if_config[i].if_peer_client_addr, sizeof(struct sockaddr_in), AF_INET)) < 0) {
+                    if ((if_config[i].if_peer_fd = connect_to_data_server((struct sockaddr_storage *)&if_config[i].if_peer_client_addr, sizeof(struct sockaddr_in), AF_INET, i)) <= 0) {
+                        log_msg(LOG_ERR, "Error connecting to server %s on data port %d - %s.\n", ipaddr, ntohs(if_config[i].if_peer_client_addr.sin_port), strerror(errno));
                         sleep(2);
                         log_msg(LOG_INFO, "Retrying data connection to server.\n");
+                    } else {
+                        log_msg(LOG_INFO, "Connected to server %s on data port %d.\n", ipaddr, ntohs(if_config[i].if_peer_client_addr.sin_port));
+                        break;
                     }
-                    else break;
                 }
             }
         }
@@ -985,29 +1058,25 @@ int main(int argc, char *argv[])
             exit(EFAULT);
         }
 
-        if (if_config[EGRESS_IF].if_peer_fd > if_config[EGRESS_IF+1].if_peer_fd) readset_fd = if_config[EGRESS_IF].if_peer_fd;
-        else                                                                     readset_fd = if_config[EGRESS_IF+1].if_peer_fd;
-
         log_msg(LOG_INFO, "%s daemon started.\n", progname);
 
         // Process data connection ping packets
+        keep_going = true;
         while (keep_going) {
             FD_ZERO(&readset);
             FD_SET(if_config[EGRESS_IF].if_peer_fd, &readset);
-            FD_SET(if_config[EGRESS_IF+1].if_peer_fd, &readset);
-            while (((rc = select(readset_fd + 1, &readset, NULL, NULL, NULL)) == -1) && (errno == EINTR));
+            while (((rc = select(FD_SETSIZE, &readset, NULL, NULL, NULL)) == -1) && (errno == EINTR));
             if (rc == -1) {
                 log_msg(LOG_WARNING, "Select returns %s.\n", strerror(errno));
+                close(if_config[EGRESS_IF].if_peer_fd);
+                close(if_config[EGRESS_IF+1].if_peer_fd);
+                keep_going = false;
                 continue;
             }
             if (FD_ISSET(if_config[EGRESS_IF].if_peer_fd, &readset)) {
-                keep_going = process_data_port_packet(if_config[EGRESS_IF].if_peer_fd, EGRESS_IF);
-            }
-            if (FD_ISSET(if_config[EGRESS_IF+1].if_peer_fd, &readset)) {
-                keep_going = process_data_port_packet(if_config[EGRESS_IF+1].if_peer_fd, EGRESS_IF+1);
+                keep_going = process_data_port_packet();
             }
         }
-        keep_going = true;
     }
 
     exit_level1_cleanup();

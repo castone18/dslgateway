@@ -56,13 +56,13 @@ extern "C" {
 struct tcp_mbuf_s {
     struct ip           ip_hdr;
     struct tcphdr       tcp_hdr;
-    unsigned char       payload[ETHERMTU];
+    uint8_t             payload[ETHERMTU];
 };
 
 struct udp_mbuf_s {
     struct ip           ip_hdr;
     struct udphdr       udp_hdr;
-    unsigned char       payload[ETHERMTU];
+    uint8_t             payload[ETHERMTU];
 };
 
 union mbuf_u {
@@ -87,12 +87,13 @@ struct thread_list_s {
 };
 
 struct comms_thread_parms_s {
-    int         peer_fd;
+    int32_t     socket_fd;
+    int32_t     connection_fd;
     pthread_t   thread_id;
 };
 
 struct if_config_s {
-    int                     if_fd;                 // fd of the file descriptor for the data port
+    int32_t                 if_fd;                 // fd of the file descriptor for the data port
     int						if_peer_fd;            // when client connects to data port, this is the fd
     uint32_t				if_port;               // data port number
     char                    if_name[IFNAMSIZ];     // name of ingress/egress interface(s)
@@ -104,7 +105,8 @@ struct if_config_s {
     struct sockaddr_in      if_peer_client_addr;   // ip address of peer
     socklen_t               if_sin_size;
     uint32_t				if_train_cnt;
-    struct timespec			if_diff;
+    struct timespec			if_peer_ts;
+    struct timespec			if_ping_ts;
     bool					if_trained;
     bool					if_peer_ts_greater;
 };
@@ -117,23 +119,28 @@ struct nf_queue_config_s {
     struct nfq_q_handle 	*qh;
     uint32_t                nf_index;
     struct thread_list_s    nf_thread;
-    unsigned int            q_control_cnt;
+    uint32_t                q_control_cnt;
     bool                    q_control;
 };
 
+#pragma pack(1)
 struct data_port_ping_s {
-	struct timespec		ts;
-	struct timespec		ts_diff;
+    char                cmd[8];
+    uint32_t            intf;
+    int64_t             ts_sec;
+    int64_t             ts_nsec;
 };
+#pragma pack()
 
 void exit_level1_cleanup(void);
 void signal_handler(int sig);
 void get_ip_addrs(void);
 void usage(char *progname);
-unsigned short iphdr_checksum(unsigned short* buff, int _16bitword);
-void *comms_thread(void *arg);
-int send_comms_pkt(int fd, const void *buf, size_t len);
-int recv_comms_pkt(int fd, void *buf, size_t len);
+uint16_t iphdr_checksum(uint16_t *buff, int _16bitword);
+void start_comms(void);
+int create_channel(uint32_t port);
+int send_pkt(int fd, const void *buf, size_t len);
+int recv_pkt(int fd, void *buf, size_t len, int flags);
 
 #ifdef __cplusplus
 }

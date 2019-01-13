@@ -48,7 +48,7 @@ static bool         syslog_on=false;
 void log_init(bool debug_on, bool syslog_enable, char *progname) 
 {
     if (syslog_enable) {
-        openlog(progname, LOG_CONS|LOG_PID, LOG_DAEMON);
+        openlog(progname, LOG_PID, LOG_DAEMON);
         syslog_on = syslog_enable;
     }
     debug = debug_on;

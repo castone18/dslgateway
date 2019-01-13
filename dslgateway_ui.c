@@ -256,10 +256,10 @@ static void print_all_stats(unsigned int iter)
     tcsetattr(STDIN_FILENO, TCSANOW, &ctrl);
 
     do {
-        send_comms_pkt(comms_serv_fd, &clntqry, sizeof(struct comms_packet_s));
-        recv_comms_pkt(comms_serv_fd, &clntrply, sizeof(struct comms_packet_s));
-        send_comms_pkt(comms_serv_fd, &srvrqry, sizeof(struct comms_packet_s));
-        recv_comms_pkt(comms_serv_fd, &srvrrply, sizeof(struct comms_packet_s));
+        send_pkt(comms_serv_fd, &clntqry, sizeof(struct comms_packet_s));
+        recv_pkt(comms_serv_fd, &clntrply, sizeof(struct comms_packet_s), MSG_WAITALL); 
+        send_pkt(comms_serv_fd, &srvrqry, sizeof(struct comms_packet_s));
+        recv_pkt(comms_serv_fd, &srvrrply, sizeof(struct comms_packet_s), MSG_WAITALL);
         printf("%s%s", clr, topLeft); // Clear screen and move to top left
         if (clntrply.pyld.rply.rc != 0) memcpy(&clntrply.pyld.rply.stats, &zero_stats, sizeof(struct statistics_s));
         if (srvrrply.pyld.rply.rc != 0) memcpy(&srvrrply.pyld.rply.stats, &zero_stats, sizeof(struct statistics_s));
@@ -293,9 +293,9 @@ static void kill_daemons(void)
 
     qry.cmd         		= COMMS_KILL;
     qry.pyld.qry.for_peer   = true;
-    send_comms_pkt(comms_serv_fd, &qry, sizeof(struct comms_packet_s));
+    send_pkt(comms_serv_fd, &qry, sizeof(struct comms_packet_s));
     qry.pyld.qry.for_peer   = false;
-    send_comms_pkt(comms_serv_fd, &qry, sizeof(struct comms_packet_s));
+    send_pkt(comms_serv_fd, &qry, sizeof(struct comms_packet_s));
 }
 
 
@@ -309,8 +309,8 @@ static void send_qcontrol(char *command)
     sscanf(&command[9], "%d %d", &qry.pyld.qry.q_control_index, &qry.pyld.qry.q_control_cnt);
     qry.cmd         		= COMMS_SET_QCONTROL;
     qry.pyld.qry.for_peer   = false;
-    send_comms_pkt(comms_serv_fd, &qry, sizeof(struct comms_packet_s));
-    recv_comms_pkt(comms_serv_fd, &rply, sizeof(struct comms_packet_s));
+    send_pkt(comms_serv_fd, &qry, sizeof(struct comms_packet_s));
+    recv_pkt(comms_serv_fd, &rply, sizeof(struct comms_packet_s), MSG_WAITALL);
 }
 
 
@@ -399,7 +399,7 @@ int main(int argc, char *argv[])
         if (strncmp(command, "exit", 4) == 0) {
             qry.cmd         		= COMMS_EXIT;
             qry.pyld.qry.for_peer   = false;
-            send_comms_pkt(comms_serv_fd, &qry, sizeof(struct comms_packet_s));
+            send_pkt(comms_serv_fd, &qry, sizeof(struct comms_packet_s));
             close(comms_serv_fd);
             exit(0);
         }

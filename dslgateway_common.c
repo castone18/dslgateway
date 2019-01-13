@@ -80,9 +80,12 @@ bool                        ipv6_mode=false;
 struct nf_queue_config_s    nfq_config[NUM_NETFILTER_QUEUES];
 int                         comms_peer_fd=-1;
 bool                        comms_addr_valid=false;
+unsigned int                cc_port=PORT;
 void                        (*exit_level2_cleanup)(void) = NULL;
 void                      	(*handle_comms_command)(struct comms_packet_s *query, struct comms_packet_s *reply,
         						int comms_client_fd, bool *connection_active) = NULL;
+
+static int                  comms_socket_fd;
 
 // +----------------------------------------------------------------------------
 // | Do some cleanup
@@ -158,9 +161,9 @@ void signal_handler(int sig)
 
 
 // +----------------------------------------------------------------------------
-// | Send comms packets and account for partial sends
+// | Send packets and account for partial sends
 // +----------------------------------------------------------------------------
-int send_comms_pkt(int fd, const void *buf, size_t len)
+int send_pkt(int fd, const void *buf, size_t len)
 {
     int             rc, bytecnt;
     uint8_t			*bufc = (uint8_t *) buf;
@@ -169,31 +172,36 @@ int send_comms_pkt(int fd, const void *buf, size_t len)
     do {
         if ((rc = send(fd, &bufc[bytecnt], len-bytecnt, 0)) == -1) {
         	rc = -1*errno;
-            log_msg(LOG_ERR, "%s-%d: Error sending comms packet to remote peer - %s", __FUNCTION__, __LINE__, strerror(errno));
+            log_msg(LOG_ERR, "%s-%d: Error sending packet to remote peer - %s", __FUNCTION__, __LINE__, strerror(errno));
             return rc;
         } else if (rc == 0) return rc;
         bytecnt += rc;
     } while (bytecnt < len);
+    return bytecnt;
 }
 
 
 // +----------------------------------------------------------------------------
 // | Receive comms packets and account for partial receives
 // +----------------------------------------------------------------------------
-int recv_comms_pkt(int fd, void *buf, size_t len)
+int recv_pkt(int fd, void *buf, size_t len, int flags)
 {
     int             rc, bytecnt;
     uint8_t			*bufc = (uint8_t *) buf;
 
     bytecnt = 0;
     do {
-        if ((rc = recv(fd, &bufc[bytecnt], len-bytecnt, 0)) == -1) {
-        	rc = -1*errno;
-            log_msg(LOG_ERR, "%s-%d: Error receiving comms packet from remote peer - %s", __FUNCTION__, __LINE__, strerror(errno));
-            return rc;
+        if ((rc = recv(fd, &bufc[bytecnt], len - bytecnt, flags)) == -1) {
+            if ((flags & MSG_DONTWAIT) && ((errno == EAGAIN) || (errno == EWOULDBLOCK))) return -1 * errno; 
+            if (errno != EINTR) {
+                rc = -1 * errno;
+                log_msg(LOG_ERR, "%s-%d: Error receiving packet from remote peer - %s", __FUNCTION__, __LINE__, strerror(errno));
+                return rc;
+            }
         } else if (rc == 0) return rc;
         bytecnt += rc;
     } while (bytecnt < len);
+    return bytecnt;
 }
 
 
@@ -211,9 +219,9 @@ static void handle_comms_query(struct comms_packet_s *query, int comms_client_fd
     if (query->pyld.qry.for_peer) {
         if (comms_addr_valid) {
             query->pyld.qry.for_peer = false;
-            if ((rc = send_comms_pkt(comms_peer_fd, query, sizeof(struct comms_packet_s))) < 0) {
+            if ((rc = send_pkt(comms_peer_fd, query, sizeof(struct comms_packet_s))) < 0) {
             	reply.pyld.rply.rc = -1*rc;
-                send_comms_pkt(comms_client_fd, &reply, sizeof(struct comms_packet_s));
+                send_pkt(comms_client_fd, &reply, sizeof(struct comms_packet_s));
                 return;
             }
         } else {
@@ -225,9 +233,9 @@ static void handle_comms_query(struct comms_packet_s *query, int comms_client_fd
         reply.pyld.rply.rc = EFAULT;
     }
 
-    if ((rc = send_comms_pkt(comms_client_fd, &reply, sizeof(struct comms_packet_s))) < 0) {
+    if ((rc = send_pkt(comms_client_fd, &reply, sizeof(struct comms_packet_s))) < 0) {
     	reply.pyld.rply.rc = -1*rc;
-        send_comms_pkt(comms_client_fd, &reply, sizeof(struct comms_packet_s));
+        send_pkt(comms_client_fd, &reply, sizeof(struct comms_packet_s));
         return;
     }
 }
@@ -236,7 +244,7 @@ static void handle_comms_query(struct comms_packet_s *query, int comms_client_fd
 // +----------------------------------------------------------------------------
 // | Thread to handle communication channel, one spawned for each connection
 // +----------------------------------------------------------------------------
-void *comms_thread(void *arg)
+static void *comms_thread(void *arg)
 {
     struct comms_thread_parms_s *thread_parms  = (struct comms_thread_parms_s *) arg;
     bool                        connection_active;
@@ -245,28 +253,155 @@ void *comms_thread(void *arg)
 
     connection_active = true;
     while(connection_active) {
-        if ((rc = recv_comms_pkt(thread_parms->peer_fd, &pkt, sizeof(struct comms_packet_s))) > 0) {
-        	if (pkt.cmd == COMMS_REPLY) {
-
-        	} else {
-                handle_comms_query(&pkt, thread_parms->peer_fd, &connection_active);
+        if ((rc = recv_pkt(thread_parms->connection_fd, &pkt, sizeof(struct comms_packet_s), MSG_WAITALL)) > 0) {
+        	if (pkt.cmd != COMMS_REPLY) {
+                handle_comms_query(&pkt, thread_parms->connection_fd, &connection_active);
         	}
         } else if (rc == 0) {
             connection_active = false;
+            comms_addr_valid = false;
+            log_msg(LOG_INFO, "Comms terminated by client.\n");
         } else if (errno == EINTR) {
             continue;
         } else {
             log_msg(LOG_WARNING, "%s-%d: Error receiving comms message from client - %s", __FUNCTION__, __LINE__, strerror(errno));
         }
     }
-    if (thread_parms->peer_fd == comms_peer_fd) {
-        comms_peer_fd       = -1;
-        comms_addr_valid    = false;
-    }
-    close(thread_parms->peer_fd);
+    close(thread_parms->connection_fd);
     free(thread_parms);
     pthread_exit(NULL);
     return NULL; // for compiler warnings
+}
+
+
+// +----------------------------------------------------------------------------
+// | Create channel - open, bind, and listen on a socket
+// +----------------------------------------------------------------------------
+int create_channel(uint32_t port)
+{
+    int                         rc, fd;
+    struct sockaddr_in6         bind_addr6;
+    struct sockaddr_in          bind_addr;
+
+    bzero((char *) &bind_addr, sizeof(bind_addr));
+    bzero((char *) &bind_addr6, sizeof(bind_addr6));
+    if (ipv6_mode) {
+        if ((fd = socket(AF_INET6, SOCK_STREAM, 0)) == -1) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Error creating socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
+            return -1*rc;
+        }
+        bind_addr6.sin6_family   = AF_INET6;
+        bind_addr6.sin6_addr     = in6addr_any;
+        bind_addr6.sin6_port     = htons((unsigned short)port);
+    } else {
+        if ((fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Error creating socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
+            close(fd);
+            return -1*rc;
+        }
+        bind_addr.sin_family        = AF_INET;
+        bind_addr.sin_addr.s_addr   = htonl(INADDR_ANY);
+        bind_addr.sin_port          = htons((unsigned short)port);
+    }
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int)) == -1) {
+        log_msg(LOG_WARNING, "%s-%d: Error setting reuse address on socket.\n", __FUNCTION__, __LINE__);
+    }
+    if (ipv6_mode) {
+        if (bind(fd, (struct sockaddr *) &bind_addr6, sizeof(bind_addr6)) == -1) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Can not bind socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
+            close(fd);
+            return -1*rc;
+        }
+    } else {
+        if (bind(fd, (struct sockaddr *) &bind_addr, sizeof(bind_addr)) == -1) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Can not bind socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
+            close(fd);
+            return -1*rc;
+        }
+    }
+
+    if (listen(fd, 1) == -1) {
+        rc = errno;
+        log_msg(LOG_ERR, "%s-%d: Can not listen on socket - %s.\n", __FUNCTION__, __LINE__, rc);
+        close(fd);
+        return -1*rc;
+    }
+    return fd;
+}
+
+
+// +----------------------------------------------------------------------------
+// | Thread to handle remote communication channel
+// +----------------------------------------------------------------------------
+static void *accept_comms_thread(void *arg)
+{
+    struct comms_thread_parms_s *thread_parms  = (struct comms_thread_parms_s *) arg;
+    char                        ipaddr[INET6_ADDRSTRLEN];
+    struct comms_thread_parms_s *comms_thread_parms;
+    socklen_t                   sin_size;
+    int                         rc;
+    struct sockaddr_in6         comms_client_addr6;
+    struct sockaddr_in          comms_client_addr;
+
+    for(;;) {
+        if ((comms_thread_parms = (struct comms_thread_parms_s *) malloc(sizeof(struct comms_thread_parms_s))) == NULL) {
+            log_msg(LOG_ERR, "%s-%d: Out of memory.\n", __FUNCTION__, __LINE__);
+            exit_level1_cleanup();
+            exit(ENOMEM);
+        }
+        if (ipv6_mode) {
+            sin_size = sizeof(comms_client_addr6);
+            if ((comms_thread_parms->connection_fd = accept(comms_socket_fd, (struct sockaddr *)&comms_client_addr6, &sin_size)) < 0) {
+                log_msg(LOG_ERR, "%s-%d: Error accepting comms connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+                continue;
+            }
+            inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&comms_client_addr6), ipaddr, sizeof ipaddr);
+        } else {
+            sin_size = sizeof(comms_client_addr);
+            if ((comms_thread_parms->connection_fd = accept(comms_socket_fd, (struct sockaddr *)&comms_client_addr, &sin_size)) < 0) {
+                log_msg(LOG_ERR, "%s-%d: Error accepting comms connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+                continue;
+            }
+            inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&comms_client_addr), ipaddr, sizeof ipaddr);
+        }
+        log_msg(LOG_INFO, "Accepted connection from %s.\n", ipaddr);
+        if ((rc = create_thread(&comms_thread_parms->thread_id, comms_thread, 1, "comms_thread", (void *) comms_thread_parms)) != 0) {
+            log_msg(LOG_ERR, "%s-%d: Can not create comms thread for connection from %s - %s.\n", __FUNCTION__, __LINE__, ipaddr, strerror(rc));
+        }
+    }
+    free(thread_parms);
+    pthread_exit(NULL);
+    return NULL; // for compiler warnings
+}
+
+
+// +----------------------------------------------------------------------------
+// | Initialize comms on comms port
+// +----------------------------------------------------------------------------
+void start_comms(void)
+{
+    int                         rc;
+    struct comms_thread_parms_s *comms_thread_parms;
+
+    if ((comms_thread_parms = (struct comms_thread_parms_s *) malloc(sizeof(struct comms_thread_parms_s))) == NULL) {
+        log_msg(LOG_ERR, "%s-%d: Out of memory.\n", __FUNCTION__, __LINE__);
+        exit_level1_cleanup();
+        exit(ENOMEM);
+    }
+
+    // Open local communication channel
+    if ((comms_socket_fd = create_channel(cc_port)) < 0) {
+        exit_level1_cleanup();
+        exit(-1*comms_socket_fd);
+    }
+
+    if ((rc = create_thread(&comms_thread_parms->thread_id, accept_comms_thread, 1, "comms_thread", (void *) comms_thread_parms)) != 0) {
+        log_msg(LOG_ERR, "%s-%d: Can not create comms thread for connection request - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
+    }
 }
 
 
@@ -336,7 +471,7 @@ void usage(char *progname)
 // +----------------------------------------------------------------------------
 // | Recalculate the ip header checksum.
 // +----------------------------------------------------------------------------
-unsigned short iphdr_checksum(unsigned short* buff, int _16bitword)
+uint16_t iphdr_checksum(uint16_t *buff, int _16bitword)
 {
     unsigned long sum;
     for(sum=0;_16bitword>0;_16bitword--)

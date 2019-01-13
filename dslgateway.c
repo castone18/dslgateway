@@ -19,7 +19,7 @@
 // |
 // | dslgateway.c
 // |
-// |    This file implements a dsl gateway that splits outgoing IP traffic between
+// |    This file is part of dsl gateway software that splits outgoing IP traffic between
 // | two DSL lines. This program is used in rural settings where DSL speeds are low.
 // | It allows two DSL lines of differing speeds to be bonded into a single internet
 // | connection, providing the sum of the two lines internet bandwidth minus a small
@@ -37,7 +37,14 @@
 // |        over the faster line and constantly adapting to line rate.
 // |     2. This program will automatically disable and re-enable packet transfer
 // |        over DSL links when they drop and come back.
-// |     3. Traffic to configurable sites can be routed directly to the ISP
+// |     3. This program does not encapsulate tcp packets inside other tcp packets.
+// |        The overhead of this program is only 6 bytes per packet with IPv4, compared
+// |        to 40 bytes when tcp is encapsulated in tcp. Due to the size of the
+// |        IPv6 address, the overhead for IPv6 is 18 bytes, but that is still much
+// |        lower than 60 bytes for tcp encapsulated in tcp with IPv6.
+// |
+// | Ideas for other features:
+// |     1. Traffic to configurable sites can be routed directly to the ISP
 // |        instead of the VPS server. This is useful for Netflix, for instance,
 // |        because Netflix will not allow traffic from VPS servers in the cloud.
 // |        Since the home gateway computer will have two ppp connections to the
@@ -51,11 +58,6 @@
 // |        that connection. This program will adjust by routing all other traffic
 // |        over the other line. Then when Netflix traffic ends, both lines are
 // |        used again.
-// |     4. This program does not encapsulate tcp packets inside other tcp packets.
-// |        The overhead of this program is only 6 bytes per packet with IPv4, compared
-// |        to 40 bytes when tcp is encapsulated in tcp. Due to the size of the
-// |        IPv6 address, the overhead for IPv6 is 18 bytes, but that is still much
-// |        lower than 60 bytes for tcp encapsulated in tcp with IPv6.
 // |
 // +----------------------------------------------------------------------------
 
@@ -105,6 +107,8 @@
 #include "util.h"
 #include "dslgateway.h"
 
+#define SELECT_TIMEOUT 5
+
 
 extern char                     *progname;
 extern struct if_config_s       if_config[NUM_EGRESS_INTERFACES];
@@ -116,6 +120,7 @@ static bool                     is_daemon;
 extern bool                     ipv6_mode;
 extern int                      comms_peer_fd;
 extern bool                     comms_addr_valid;
+extern unsigned int             cc_port;
 extern void                     (*handle_comms_command)(struct comms_packet_s *query, struct comms_packet_s *reply,
                                     int comms_client_fd, bool *connection_active);
 
@@ -127,8 +132,10 @@ static struct sockaddr_in       *client_addr4[NUM_EGRESS_INTERFACES] = {(struct 
 static bool                     debug=false;
 static char                     config_file_name[PATH_MAX];
 static bool                     q_control_on=false;
-static unsigned int             cc_port=PORT;
 static unsigned int             data_port_cnt=0;
+static unsigned int             client_cc_port;
+static bool                     ping_reply_rcvd[NUM_EGRESS_INTERFACES];
+static uint32_t                 pingrate=5;
 
 
 //// +----------------------------------------------------------------------------
@@ -376,21 +383,21 @@ static void handle_server_command(struct comms_packet_s *query, struct comms_pac
                     memcpy(&client_addr[1], &query->pyld.qry.helo_data.egress_addr[1], sizeof(struct sockaddr_in));
                     memcpy(&nf_stats.client_sa[0], &query->pyld.qry.helo_data.egress_addr[0], sizeof(struct sockaddr_in));
                     memcpy(&nf_stats.client_sa[1], &query->pyld.qry.helo_data.egress_addr[1], sizeof(struct sockaddr_in));
-                    inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&client_addr[0]), client_ip_str[0], INET6_ADDRSTRLEN);
-                    inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&client_addr[1]), client_ip_str[1], INET6_ADDRSTRLEN);
+                    inet_ntop(AF_INET, get_in_addr((struct sockaddr *)client_addr4[0]), client_ip_str[0], INET_ADDRSTRLEN);
+                    inet_ntop(AF_INET, get_in_addr((struct sockaddr *)client_addr4[1]), client_ip_str[1], INET_ADDRSTRLEN);
                 }
                 comms_addr_valid            = true;
                 nf_stats.client_connected   = true;
                 if_config[0].if_ratio       = query->pyld.qry.helo_data.if_ratio[0];
                 if_config[1].if_ratio       = query->pyld.qry.helo_data.if_ratio[1];
-                cc_port                     = query->pyld.qry.helo_data.cc_port;
+                client_cc_port              = query->pyld.qry.helo_data.cc_port;
                 comms_peer_fd               = comms_client_fd;
                 reply->pyld.rply.rc                   = 0;
-                log_msg(LOG_INFO, "HELO received.");
-                log_msg(LOG_INFO, "Client address1: %s  Client address2: %s.\n", client_ip_str[0], client_ip_str[1]);
-                log_msg(LOG_INFO, "IF ratio1: %u  IF ratio2: %u  Port: %u", if_config[0].if_ratio, if_config[1].if_ratio, cc_port);
+                log_debug_msg(LOG_INFO, "HELO received.\n");
+                log_debug_msg(LOG_INFO, "Client address1: %s  Client address2: %s.\n", client_ip_str[0], client_ip_str[1]);
+                log_debug_msg(LOG_INFO, "IF ratio1: %u  IF ratio2: %u  Port: %u\n", if_config[0].if_ratio, if_config[1].if_ratio, cc_port);
             } else {
-                log_msg(LOG_WARNING, "Received duplicate HELO, discarded.");
+                log_msg(LOG_WARNING, "Received duplicate HELO, discarded.\n");
                 reply->pyld.rply.rc                   = 1;
             }
             break;
@@ -406,7 +413,7 @@ static void handle_server_command(struct comms_packet_s *query, struct comms_pac
         case COMMS_KILL:
             reply->pyld.rply.rc        = 0;
             reply->pyld.rply.is_client = false;
-            send(comms_client_fd, &reply, sizeof(struct comms_reply_s), 0);
+            send_pkt(comms_client_fd, &reply, sizeof(struct comms_reply_s));
             exit_level1_cleanup();
             exit(EXIT_SUCCESS);
             break;
@@ -446,12 +453,11 @@ static void read_config_file(void)
         return;
     }
 
-    if (config_lookup_int(&cfg, "port", &cc_port))
-        log_msg(LOG_INFO, "Configured for comms port on %d.\n", cc_port);
     if (config_lookup_int(&cfg, "ipversion", &i)) {
         if (i == 6) ipv6_mode = true;
         log_msg(LOG_INFO, "Configured for %s.\n", ipv6_mode ? "ipv6" : "ipv4");
     }
+    nf_stats.ipv6_mode      = ipv6_mode;
     if (config_lookup_bool(&cfg, "qcontrol", &i)) {
         q_control_on = i;
         log_msg(LOG_INFO, "Configured for debugging queue control %s.\n", q_control_on ? "on" : "off");
@@ -469,6 +475,9 @@ static void read_config_file(void)
     if (config_lookup_int(&cfg, "server.ingress.nf_q_no", &nfq_config[INGRESS_NFQ].nfq_q_no)) {
         log_msg(LOG_INFO, "Configured for ingress netfilter queue on %u.\n", nfq_config[INGRESS_NFQ].nfq_q_no);
     }
+    if (config_lookup_int(&cfg, "server.pingrate", &pingrate)) {
+        log_msg(LOG_INFO, "Configured for ping rate of %d seconds.\n", pingrate);
+    }
     config_string = NULL;
     if (config_lookup_string(&cfg, "server.interface", &config_string)) {
         strcpy(if_config[EGRESS_IF].if_name, config_string);
@@ -483,12 +492,14 @@ static void read_config_file(void)
 // +----------------------------------------------------------------------------
 // | Process packets from server received on the two data port connections.
 // +----------------------------------------------------------------------------
-static bool process_data_port_packet(int fd, int ifindex)
+static bool process_data_port_packet(int ifindex)
 {
     struct data_port_ping_s        data_port_ping;
     int                            rc;
 
-    while (((rc = recv(fd, &data_port_ping, sizeof(data_port_ping), 0)) == -1) && (errno == EINTR));
+    log_debug_msg(LOG_INFO, "%s-%d, ifindex = %d\n", __FUNCTION__, __LINE__, ifindex);
+    rc = recv_pkt(if_config[ifindex].if_peer_fd, &data_port_ping, sizeof(struct data_port_ping_s), MSG_WAITALL);
+    log_debug_msg(LOG_INFO, "%s-%d: recv_pkt rc = %d\n", __FUNCTION__, __LINE__, rc);
     if (rc == 0) {
         log_msg(LOG_WARNING, "Closing data port connections.\n");
         close(if_config[EGRESS_IF].if_peer_fd);
@@ -497,74 +508,18 @@ static bool process_data_port_packet(int fd, int ifindex)
     }
     if (rc > 0) {
         if (rc != sizeof(data_port_ping)) {
-            log_msg(LOG_INFO, "Data port packet dropped - invalid size %d.\n", rc);
+            log_debug_msg(LOG_INFO, "Data port packet dropped - invalid size %d, should be %d.\n", rc, sizeof(data_port_ping));
         } else {
-            log_msg(LOG_INFO, "Received data port packet from port %u.\n", if_config[ifindex].if_port);
+            ping_reply_rcvd[ifindex] = true;
+            log_debug_msg(LOG_INFO, "Received data port packet from port %u.\n", if_config[ifindex].if_port);
+            if (data_port_ping.intf == EGRESS_IF+1) {
+                log_debug_msg(LOG_INFO, "ts.tv_sec=%ld, ts.tv_nsec=%ld.\n", data_port_ping.ts_sec, data_port_ping.ts_nsec); 
+            }
         }
     } else {
         log_msg(LOG_WARNING, "Data port receive returns %s.\n", strerror(errno));
     }
     return true;
-}
-
-
-// +----------------------------------------------------------------------------
-// | Create channel
-// +----------------------------------------------------------------------------
-static int create_channel(unsigned int port)
-{
-    int                         rc, fd;
-    struct sockaddr_in6         bind_addr6;
-    struct sockaddr_in          bind_addr;
-
-    bzero((char *) &bind_addr, sizeof(bind_addr));
-    bzero((char *) &bind_addr6, sizeof(bind_addr6));
-    if (ipv6_mode) {
-        if ((fd = socket(AF_INET6, SOCK_STREAM, 0)) == -1) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Error creating socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
-            return -1*rc;
-        }
-        bind_addr6.sin6_family   = AF_INET6;
-        bind_addr6.sin6_addr     = in6addr_any;
-        bind_addr6.sin6_port     = htons((unsigned short)port);
-    } else {
-        if ((fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Error creating socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
-            close(fd);
-            return -1*rc;
-        }
-        bind_addr.sin_family        = AF_INET;
-        bind_addr.sin_addr.s_addr   = htonl(INADDR_ANY);
-        bind_addr.sin_port          = htons((unsigned short)port);
-    }
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int)) == -1) {
-        log_msg(LOG_WARNING, "%s-%d: Error setting reuse address on socket.\n", __FUNCTION__, __LINE__);
-    }
-    if (ipv6_mode) {
-        if (bind(fd, (struct sockaddr *) &bind_addr6, sizeof(bind_addr6)) == -1) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not bind socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
-            close(fd);
-            return -1*rc;
-        }
-    } else {
-        if (bind(fd, (struct sockaddr *) &bind_addr, sizeof(bind_addr)) == -1) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not bind socket - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
-            close(fd);
-            return -1*rc;
-        }
-    }
-
-    if (listen(fd, 1) == -1) {
-        rc = errno;
-        log_msg(LOG_ERR, "%s-%d: Can not listen on socket - %s.\n", __FUNCTION__, __LINE__, rc);
-        close(fd);
-        return -1*rc;
-    }
-    return fd;
 }
 
 
@@ -593,83 +548,153 @@ static void open_data_ports(void)
         }
         if_config[i].if_index = ifr.ifr_ifindex;
         // Bind socket to a particular interface name (eg: ppp0 or ppp1)
-        if (setsockopt(if_config[i].if_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof(ifr)) < 0) {
+#if 0
+        if (setsockopt(if_config[i].if_fd, SOL_SOCKET, SO_BINDTODEVICE, (void *)&ifr, sizeof(ifr)) < 0) {
+            rc = errno; 
+            log_msg(LOG_ERR, "%s-%d: Can not bind socket to %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno)); 
+            exit_level1_cleanup(); 
+            exit(rc);
+        }
+        log_debug_msg(LOG_INFO, "%s-%d: Interface %d bound to %s.\n", __FUNCTION__, __LINE__, i, ifr.ifr_name); 
+#endif                
+    }
+}
+
+
+// +----------------------------------------------------------------------------
+// | Initialize netfilter
+// +----------------------------------------------------------------------------
+static void init_netfilter(void) 
+{
+    int rc;
+
+//    nfq_config[INGRESS_NFQ].nfq_cb                    = &home_to_vps_pkt_mangler_cb;
+    nfq_config[INGRESS_NFQ].nf_index                = INGRESS_NFQ;
+    nfq_config[INGRESS_NFQ].nf_thread.keep_going    = true;
+    if (q_control_on) {
+        nfq_config[INGRESS_NFQ].q_control            = true;
+        nfq_config[INGRESS_NFQ].q_control_cnt        = 0;
+    }
+    else {
+        nfq_config[INGRESS_NFQ].q_control            = false;
+    }
+    if ((nfq_config[INGRESS_NFQ].h = nfq_open()) == NULL) {
+        rc = errno;
+        log_msg(LOG_ERR, "%s-%d: Error opening netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+        exit_level1_cleanup();
+        exit(rc);
+    }
+
+    if (ipv6_mode) {
+        if (nfq_unbind_pf(nfq_config[INGRESS_NFQ].h, AF_INET6) < 0) {
             rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Can not bind socket to %s - %s.\n", __FUNCTION__, __LINE__, ifr.ifr_name, strerror(errno));
+            log_msg(LOG_ERR, "%s-%d: Error unbinding from netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
             exit_level1_cleanup();
             exit(rc);
         }
-        log_debug_msg(LOG_INFO, "%s-%d: Interface %d bound to %s.\n", __FUNCTION__, __LINE__, i, ifr.ifr_name);
+        if (nfq_bind_pf(nfq_config[INGRESS_NFQ].h, AF_INET6) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Error binding to netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        }
+    } else {
+        if (nfq_unbind_pf(nfq_config[INGRESS_NFQ].h, AF_INET) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Error unbinding from netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        }
+        if (nfq_bind_pf(nfq_config[INGRESS_NFQ].h, AF_INET) < 0) {
+            rc = errno;
+            log_msg(LOG_ERR, "%s-%d: Error binding to netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            exit_level1_cleanup();
+            exit(rc);
+        }
+    }
+
+//    nfq_config[EGRESS_NFQ].nfq_cb                    = &home_to_vps_pkt_mangler_cb;
+//    nfq_config[EGRESS_NFQ].nf_index                    = EGRESS_NFQ;
+//    nfq_config[EGRESS_NFQ].nf_thread.keep_going        = true;
+    if (q_control_on) {
+        nfq_config[EGRESS_NFQ].q_control            = true;
+        nfq_config[EGRESS_NFQ].q_control_cnt        = 0;
+    }
+    else {
+        nfq_config[EGRESS_NFQ].q_control            = false;
     }
 }
 
 
+
 // +----------------------------------------------------------------------------
-// | Thread to handle remote communication channel
 // +----------------------------------------------------------------------------
-static void *accept_comms_thread(void *arg)
+static void accept_data_connection(int ifnum)
 {
-    struct comms_thread_parms_s *thread_parms  = (struct comms_thread_parms_s *) arg;
     char                        ipaddr[INET6_ADDRSTRLEN];
-    struct comms_thread_parms_s *comms_thread_parms;
-    socklen_t                   sin_size;
-    int                         rc;
-    struct sockaddr_in6         comms_client_addr6;
-    struct sockaddr_in          comms_client_addr;
 
-    for(;;) {
-        if ((comms_thread_parms = (struct comms_thread_parms_s *) malloc(sizeof(struct comms_thread_parms_s))) == NULL) {
-            log_msg(LOG_ERR, "%s-%d: Out of memory.\n", __FUNCTION__, __LINE__);
-            sleep(1);
-            continue;
+    if (ipv6_mode) {
+        if_config[ifnum].if_sin_size = sizeof(if_config[ifnum].if_peer_client_addr6);
+        if ((if_config[ifnum].if_peer_fd = accept(if_config[ifnum].if_fd, (struct sockaddr *)&if_config[ifnum].if_peer_client_addr6, &if_config[ifnum].if_sin_size)) < 0) {
+            log_msg(LOG_ERR, "%s-%d: Error accepting peer data connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            return;
         }
-        if (ipv6_mode) {
-            sin_size = sizeof(comms_client_addr6);
-            if ((comms_thread_parms->peer_fd = accept(thread_parms->peer_fd, (struct sockaddr *)&comms_client_addr6, &sin_size)) < 0) {
-                log_msg(LOG_ERR, "%s-%d: Error accepting comms connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-                continue;
-            }
-            inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&comms_client_addr6), ipaddr, sizeof ipaddr);
-        } else {
-            sin_size = sizeof(comms_client_addr);
-            if ((comms_thread_parms->peer_fd = accept(thread_parms->peer_fd, (struct sockaddr *)&comms_client_addr, &sin_size)) < 0) {
-                log_msg(LOG_ERR, "%s-%d: Error accepting comms connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-                continue;
-            }
-            inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&comms_client_addr), ipaddr, sizeof ipaddr);
+        inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&if_config[ifnum].if_peer_client_addr6), ipaddr, sizeof ipaddr);
+        if ((memcmp(&if_config[ifnum].if_peer_client_addr6.sin6_addr, &client_addr6[0]->sin6_addr, sizeof(struct in6_addr)) != 0) &&
+            (memcmp(&if_config[ifnum].if_peer_client_addr6.sin6_addr, &client_addr6[1]->sin6_addr, sizeof(struct in6_addr)) != 0)) {
+            log_msg(LOG_INFO, "Closing connection from unknown host %s.\n", ipaddr);
+            close(if_config[ifnum].if_peer_fd);
+            if_config[ifnum].if_peer_fd = -1;
+            return;
         }
-        log_msg(LOG_INFO, "Accepted connection from %s.\n", ipaddr);
-        if ((rc = create_thread(&comms_thread_parms->thread_id, comms_thread, 1, "comms_thread", (void *) comms_thread_parms)) != 0) {
-            log_msg(LOG_ERR, "%s-%d: Can not create comms thread for connection from %s - %s.\n", __FUNCTION__, __LINE__, ipaddr, strerror(rc));
+        log_msg(LOG_INFO, "Accepted peer data connection from %s on port %u.\n", ipaddr, if_config[ifnum].if_port);
+    } else {
+        if_config[ifnum].if_sin_size = sizeof(if_config[ifnum].if_peer_client_addr);
+        if ((if_config[ifnum].if_peer_fd = accept(if_config[ifnum].if_fd, (struct sockaddr *)&if_config[ifnum].if_peer_client_addr, &if_config[ifnum].if_sin_size)) < 0) {
+            log_msg(LOG_ERR, "%s-%d: Error accepting peer data connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
+            return;
         }
+        inet_ntop(AF_INET, get_in_addr((struct sockaddr *)&if_config[ifnum].if_peer_client_addr), ipaddr, sizeof ipaddr);
+        if ((if_config[ifnum].if_peer_client_addr.sin_addr.s_addr != client_addr4[0]->sin_addr.s_addr) &&
+            (if_config[ifnum].if_peer_client_addr.sin_addr.s_addr != client_addr4[1]->sin_addr.s_addr)) {
+            log_msg(LOG_INFO, "Closing connection from unknown host %s.\n", ipaddr);
+            close(if_config[ifnum].if_peer_fd);
+            if_config[ifnum].if_peer_fd = -1;
+            return;
+        }
+        log_msg(LOG_INFO, "Accepted peer data connection from %s on port %u.\n", ipaddr, if_config[ifnum].if_port);
     }
-    pthread_exit(NULL);
-    return NULL; // for compiler warnings
 }
 
 
 // +----------------------------------------------------------------------------
-// | Process local comms port
 // +----------------------------------------------------------------------------
-static void process_comms(void)
+static void send_ping_packets(void)
 {
-    int                         rc;
-    struct comms_thread_parms_s *comms_thread_parms;
+    struct data_port_ping_s dpp;
+    int                     rc;
+    struct timespec         ts;
 
-    if ((comms_thread_parms = (struct comms_thread_parms_s *) malloc(sizeof(struct comms_thread_parms_s))) == NULL) {
-        log_msg(LOG_ERR, "%s-%d: Out of memory.\n", __FUNCTION__, __LINE__);
-        exit_level1_cleanup();
-        exit(ENOMEM);
+    strncpy(dpp.cmd, "pingq", 6);
+    if (ping_reply_rcvd[EGRESS_IF]) {
+        ping_reply_rcvd[EGRESS_IF] = false;
+        dpp.intf = EGRESS_IF;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        dpp.ts_sec = ts.tv_sec;
+        dpp.ts_nsec = ts.tv_nsec;
+        if ((rc = send_pkt(if_config[EGRESS_IF].if_peer_fd, &dpp, sizeof(struct data_port_ping_s))) < sizeof(struct data_port_ping_s)) {
+            log_debug_msg(LOG_ERR, "%s:%d: Error in send_pkt, rc=%d, expected %d.\n", __FUNCTION__, __LINE__, rc, sizeof(struct data_port_ping_s));
+        }
     }
-
-    // Open local communication channel
-    if ((comms_thread_parms->peer_fd = create_channel(cc_port)) < 0) {
-        exit_level1_cleanup();
-        exit(-1*comms_thread_parms->peer_fd);
-    }
-
-    if ((rc = create_thread(&comms_thread_parms->thread_id, accept_comms_thread, 1, "comms_thread", (void *) comms_thread_parms)) != 0) {
-        log_msg(LOG_ERR, "%s-%d: Can not create comms thread for connection request - %s.\n", __FUNCTION__, __LINE__, strerror(rc));
+    if (ping_reply_rcvd[EGRESS_IF+1]) {
+        ping_reply_rcvd[EGRESS_IF+1] = false;
+        dpp.intf = EGRESS_IF+1;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        dpp.ts_sec = ts.tv_sec;
+        dpp.ts_nsec = ts.tv_nsec;
+        if ((rc = send_pkt(if_config[EGRESS_IF+1].if_peer_fd, &dpp, sizeof(struct data_port_ping_s))) < sizeof(struct data_port_ping_s)) {
+            log_debug_msg(LOG_ERR, "%s:%d: Error in send_pkt, rc=%d, expected %d.\n", __FUNCTION__, __LINE__, rc, sizeof(struct data_port_ping_s));
+        }
     }
 }
 
@@ -679,14 +704,14 @@ static void process_comms(void)
 // +----------------------------------------------------------------------------
 int main(int argc, char *argv[])
 {
-    int                         option, i, rc, readset_fd;
+    int                         option, i, rc;
     bool                        daemonize = true;
     pid_t                       pid, sid;
     struct sigaction            sigact;
     struct sched_param          sparam;
-    char                        ipaddr[INET6_ADDRSTRLEN];
     fd_set                      readset;
     bool                        keep_going=true;
+    struct timeval              select_timeout;
 
     i=0;
     if (argv[0][0] == '.' || argv[0][0] == '/') i++;
@@ -722,6 +747,7 @@ int main(int argc, char *argv[])
                 usage(progname);
                 break;
             case 'c':
+                memset(config_file_name, 0, PATH_MAX);
                 strncpy(config_file_name, optarg, strlen(optarg)+1);
                 break;
             default:
@@ -787,63 +813,7 @@ int main(int argc, char *argv[])
 
 
     // Initialize netfilter queue config
-//    nfq_config[INGRESS_NFQ].nfq_cb                    = &home_to_vps_pkt_mangler_cb;
-    nfq_config[INGRESS_NFQ].nf_index                = INGRESS_NFQ;
-    nfq_config[INGRESS_NFQ].nf_thread.keep_going    = true;
-    if (q_control_on) {
-        nfq_config[INGRESS_NFQ].q_control            = true;
-        nfq_config[INGRESS_NFQ].q_control_cnt        = 0;
-    }
-    else {
-        nfq_config[INGRESS_NFQ].q_control            = false;
-    }
-    if ((nfq_config[INGRESS_NFQ].h = nfq_open()) == NULL) {
-        rc = errno;
-        log_msg(LOG_ERR, "%s-%d: Error opening netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-        exit_level1_cleanup();
-        exit(rc);
-    }
-
-    if (ipv6_mode) {
-        if (nfq_unbind_pf(nfq_config[INGRESS_NFQ].h, AF_INET6) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Error unbinding from netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-        if (nfq_bind_pf(nfq_config[INGRESS_NFQ].h, AF_INET6) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Error binding to netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-    } else {
-        if (nfq_unbind_pf(nfq_config[INGRESS_NFQ].h, AF_INET) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Error unbinding from netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-        if (nfq_bind_pf(nfq_config[INGRESS_NFQ].h, AF_INET) < 0) {
-            rc = errno;
-            log_msg(LOG_ERR, "%s-%d: Error binding to netfilter queue - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-            exit_level1_cleanup();
-            exit(rc);
-        }
-    }
-
-//    nfq_config[EGRESS_NFQ].nfq_cb                    = &home_to_vps_pkt_mangler_cb;
-//    nfq_config[EGRESS_NFQ].nf_index                    = EGRESS_NFQ;
-//    nfq_config[EGRESS_NFQ].nf_thread.keep_going        = true;
-    if (q_control_on) {
-        nfq_config[EGRESS_NFQ].q_control            = true;
-        nfq_config[EGRESS_NFQ].q_control_cnt        = 0;
-    }
-    else {
-        nfq_config[EGRESS_NFQ].q_control            = false;
-    }
-
-    nf_stats.ipv6_mode      = ipv6_mode;
+    init_netfilter();
 
     // Start up the server threads
     if (create_threads()) {
@@ -852,76 +822,67 @@ int main(int argc, char *argv[])
     }
 
     // Start comms thread
-    process_comms();
+    start_comms();
 
+    // 
     for (;;) {
         log_msg(LOG_INFO, "Waiting for data port connections.\n");
         // Accept the data port connections
         if_config[EGRESS_IF].if_peer_fd = -1;
         if_config[EGRESS_IF+1].if_peer_fd = -1;
-        for (i=0; i<NUM_EGRESS_INTERFACES; i++) {
-            while (if_config[i].if_peer_fd < 0) {
-                if (ipv6_mode) {
-                    if_config[i].if_sin_size = sizeof(if_config[i].if_peer_client_addr6);
-                    if ((if_config[i].if_peer_fd = accept(if_config[i].if_fd, (struct sockaddr *)&if_config[i].if_peer_client_addr6, &if_config[i].if_sin_size)) < 0) {
-                        log_msg(LOG_ERR, "%s-%d: Error accepting peer data connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-                        continue;
-                    }
-                    inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&if_config[i].if_peer_client_addr6), ipaddr, sizeof ipaddr);
-                    if (memcmp(&if_config[i].if_peer_client_addr6.sin6_addr, &client_addr6[i]->sin6_addr, sizeof(struct in6_addr)) != 0) {
-                        log_msg(LOG_INFO, "Closing connection from unknown host %s.\n", ipaddr);
-                        close(if_config[i].if_peer_fd);
-                        if_config[i].if_peer_fd = -1;
-                        continue;
-                    }
-                    log_msg(LOG_INFO, "Accepted peer data connection from %s on port %u.\n", ipaddr, if_config[i].if_port);
-                } else {
-                    if_config[i].if_sin_size = sizeof(if_config[i].if_peer_client_addr);
-                    if ((if_config[i].if_peer_fd = accept(if_config[i].if_fd, (struct sockaddr *)&if_config[i].if_peer_client_addr, &if_config[i].if_sin_size)) < 0) {
-                        log_msg(LOG_ERR, "%s-%d: Error accepting peer data connection - %s.\n", __FUNCTION__, __LINE__, strerror(errno));
-                        continue;
-                    }
-                    inet_ntop(AF_INET6, get_in_addr((struct sockaddr *)&if_config[i].if_peer_client_addr), ipaddr, sizeof ipaddr);
-                    if (if_config[i].if_peer_client_addr.sin_addr.s_addr != client_addr4[i]->sin_addr.s_addr) {
-                        log_msg(LOG_INFO, "Closing connection from unknown host %s.\n", ipaddr);
-                        close(if_config[i].if_peer_fd);
-                        if_config[i].if_peer_fd = -1;
-                        continue;
-                    }
-                    log_msg(LOG_INFO, "Accepted peer data connection from %s on port %u.\n", ipaddr, if_config[i].if_port);
+        while ((if_config[EGRESS_IF].if_peer_fd == -1) || (if_config[EGRESS_IF+1].if_peer_fd == -1)) {
+            FD_ZERO(&readset);
+            if (if_config[EGRESS_IF].if_peer_fd == -1) FD_SET(if_config[EGRESS_IF].if_fd, &readset);
+            if (if_config[EGRESS_IF+1].if_peer_fd == -1) FD_SET(if_config[EGRESS_IF+1].if_fd, &readset);
+            select_timeout.tv_sec = SELECT_TIMEOUT;
+            select_timeout.tv_usec = 0;
+            if ((rc = select(FD_SETSIZE, &readset, NULL, NULL, &select_timeout)) == -1) {
+                log_msg(LOG_ERR, "Select error on data port sockets - %s.\n", strerror(errno));
+                sleep(2); // Prevent select error busy loop
+                continue;
+            } else if (rc == 0) {
+                log_debug_msg(LOG_INFO, "Select timeout waiting for data port connections.\n");
+            } else {
+                if (FD_ISSET(if_config[EGRESS_IF].if_fd, &readset)) {
+                    accept_data_connection(EGRESS_IF);
+                }
+                if (FD_ISSET(if_config[EGRESS_IF+1].if_fd, &readset)) {
+                    accept_data_connection(EGRESS_IF+1);
                 }
             }
         }
 
-        if (if_config[EGRESS_IF].if_peer_fd < 0 || if_config[EGRESS_IF+1].if_peer_fd < 0) {
-            log_msg(LOG_ERR, "Can not establish data connections to server.\n");
-            exit_level1_cleanup();
-            exit(EFAULT);
-        }
-
-        if (if_config[EGRESS_IF].if_peer_fd > if_config[EGRESS_IF+1].if_peer_fd) readset_fd = if_config[EGRESS_IF].if_peer_fd;
-        else                                                                     readset_fd = if_config[EGRESS_IF+1].if_peer_fd;
-
         log_msg(LOG_INFO, "%s daemon started.\n", progname);
 
         // Process data connection ping packets
+        keep_going = true;
+        ping_reply_rcvd[EGRESS_IF] = true;
+        ping_reply_rcvd[EGRESS_IF+1] = true;
         while (keep_going) {
             FD_ZERO(&readset);
             FD_SET(if_config[EGRESS_IF].if_peer_fd, &readset);
             FD_SET(if_config[EGRESS_IF+1].if_peer_fd, &readset);
-            while (((rc = select(readset_fd + 1, &readset, NULL, NULL, NULL)) == -1) && (errno == EINTR));
+            select_timeout.tv_sec = pingrate;
+            select_timeout.tv_usec = 0;
+            while (((rc = select(FD_SETSIZE, &readset, NULL, NULL, &select_timeout)) == -1) && (errno == EINTR));
             if (rc == -1) {
-                log_msg(LOG_WARNING, "Select returns %s.\n", strerror(errno));
+                log_msg(LOG_WARNING, "Data port select returns %s.\n", strerror(errno));
+                close(if_config[EGRESS_IF].if_peer_fd);
+                close(if_config[EGRESS_IF+1].if_peer_fd);
+                keep_going = false;
+                continue;
+            }
+            if (rc == 0) {
+                send_ping_packets();
                 continue;
             }
             if (FD_ISSET(if_config[EGRESS_IF].if_peer_fd, &readset)) {
-                keep_going = process_data_port_packet(if_config[EGRESS_IF].if_peer_fd, EGRESS_IF);
+                keep_going = process_data_port_packet(EGRESS_IF);
             }
             if (FD_ISSET(if_config[EGRESS_IF+1].if_peer_fd, &readset)) {
-                keep_going = process_data_port_packet(if_config[EGRESS_IF+1].if_peer_fd, EGRESS_IF+1);
+                keep_going = process_data_port_packet(EGRESS_IF+1);
             }
         }
-        keep_going = true;
     }
 
     exit_level1_cleanup();
